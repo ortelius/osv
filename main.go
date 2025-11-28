@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
@@ -31,6 +33,25 @@ type vulnID struct {
 
 type cveText struct {
 	Description string `json:"cvetext"`
+}
+
+// SimplifiedRange represents a flattened version range for fast querying
+type SimplifiedRange struct {
+	Ecosystem          string  `json:"ecosystem"`
+	Type               string  `json:"type"`
+	Introduced         *string `json:"introduced,omitempty"`
+	Fixed              *string `json:"fixed,omitempty"`
+	LastAffected       *string `json:"last_affected,omitempty"`
+	IntroducedPadded   *string `json:"introduced_padded,omitempty"`
+	FixedPadded        *string `json:"fixed_padded,omitempty"`
+	LastAffectedPadded *string `json:"last_affected_padded,omitempty"`
+}
+
+// AffectedVersions groups all version information for a specific package
+type AffectedVersions struct {
+	ExactVersions       []string          `json:"exact_versions,omitempty"`
+	ExactVersionsPadded []string          `json:"exact_versions_padded,omitempty"`
+	Ranges              []SimplifiedRange `json:"ranges,omitempty"`
 }
 
 var logger = database.InitLogger()
@@ -150,6 +171,243 @@ func getSeverityRating(score float64) string {
 		return "HIGH"
 	}
 	return "CRITICAL"
+}
+
+// padSemver converts a semantic version to a zero-padded string for lexicographic comparison
+// Examples:
+//
+//	"4.1.5"        → "0004.0001.0005"
+//	"4.1.5-alpha"  → "0004.0001.0005-alpha"
+//	"4.1.5+build"  → "0004.0001.0005+build"
+//
+// Returns empty string if version cannot be padded (invalid format or complex cases)
+func padSemver(version string) string {
+	if version == "" {
+		return ""
+	}
+
+	// Remove leading 'v'
+	version = strings.TrimPrefix(version, "v")
+
+	// Handle OSV "0" special value
+	if version == "0" {
+		return "0000.0000.0000"
+	}
+
+	// Split on - and + to separate core version from pre-release and build metadata
+	var coreVersion, preRelease, buildMetadata string
+
+	if plusIdx := strings.Index(version, "+"); plusIdx != -1 {
+		buildMetadata = version[plusIdx:]
+		version = version[:plusIdx]
+	}
+
+	if dashIdx := strings.Index(version, "-"); dashIdx != -1 {
+		preRelease = version[dashIdx:]
+		coreVersion = version[:dashIdx]
+	} else {
+		coreVersion = version
+	}
+
+	// EDGE CASE DETECTION: Pre-release with numbers that need proper ordering
+	// e.g., "alpha1" vs "alpha10" - lexicographic comparison fails
+	if preRelease != "" {
+		// Check if pre-release contains numbers after letters
+		// e.g., "alpha1", "beta10", "rc2"
+		if matched, _ := regexp.MatchString(`[a-zA-Z]\d+`, preRelease); matched {
+			// This needs proper semver comparison, not lexicographic
+			return "" // Force Go processing
+		}
+	}
+
+	// Split core version into parts
+	parts := strings.Split(coreVersion, ".")
+	if len(parts) < 1 || len(parts) > 3 {
+		return "" // Invalid format
+	}
+
+	// Pad to 3 parts
+	for len(parts) < 3 {
+		parts = append(parts, "0")
+	}
+
+	// Pad each part to 4 digits
+	var paddedParts []string
+	for _, part := range parts {
+		// Check if purely numeric
+		num, err := strconv.Atoi(part)
+		if err != nil || num < 0 || num > 9999 {
+			return "" // Non-numeric or too large
+		}
+		paddedParts = append(paddedParts, fmt.Sprintf("%04d", num))
+	}
+
+	// Reconstruct version
+	result := strings.Join(paddedParts, ".")
+	result += preRelease + buildMetadata
+
+	return result
+}
+
+// addDenormalizedVersionData adds pre-computed version data for fast AQL querying
+// This enables database-side filtering instead of returning 10,000+ rows to Go
+func addDenormalizedVersionData(content map[string]interface{}) {
+	affected, ok := content["affected"].([]interface{})
+	if !ok || len(affected) == 0 {
+		return
+	}
+
+	affectedPurlSet := make(map[string]bool)
+	affectedVersionsMap := make(map[string]AffectedVersions)
+
+	for _, affectedItem := range affected {
+		affectedObj, ok := affectedItem.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get package info
+		packageInfo, ok := affectedObj["package"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Build base PURL
+		basePurl := ""
+		if purl, ok := packageInfo["purl"].(string); ok && purl != "" {
+			// Clean and get base PURL
+			cleanedPurl, err := util.CleanPURL(purl)
+			if err != nil {
+				logger.Sugar().Warnf("Failed to parse PURL %s: %v", purl, err)
+				continue
+			}
+			basePurl, err = util.GetBasePURL(cleanedPurl)
+			if err != nil {
+				logger.Sugar().Warnf("Failed to get base PURL from %s: %v", cleanedPurl, err)
+				continue
+			}
+		} else if ecosystem, eok := packageInfo["ecosystem"].(string); eok {
+			if name, nok := packageInfo["name"].(string); nok {
+				purlType := util.EcosystemToPurlType(ecosystem)
+				if purlType != "" {
+					basePurl = fmt.Sprintf("pkg:%s/%s", purlType, name)
+				}
+			}
+		}
+
+		if basePurl == "" {
+			continue
+		}
+
+		affectedPurlSet[basePurl] = true
+
+		// Get or create entry for this PURL
+		affectedVersions := affectedVersionsMap[basePurl]
+
+		// Process exact versions
+		if versions, ok := affectedObj["versions"].([]interface{}); ok && len(versions) > 0 {
+			for _, v := range versions {
+				if vStr, ok := v.(string); ok {
+					affectedVersions.ExactVersions = append(affectedVersions.ExactVersions, vStr)
+
+					// Add padded version if possible
+					if padded := padSemver(vStr); padded != "" {
+						affectedVersions.ExactVersionsPadded = append(affectedVersions.ExactVersionsPadded, padded)
+					}
+				}
+			}
+		}
+
+		// Process ranges
+		if ranges, ok := affectedObj["ranges"].([]interface{}); ok && len(ranges) > 0 {
+			ecosystem := ""
+			if e, ok := packageInfo["ecosystem"].(string); ok {
+				ecosystem = e
+			}
+
+			for _, rangeItem := range ranges {
+				rangeObj, ok := rangeItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				rangeType, _ := rangeObj["type"].(string)
+
+				// Only process SEMVER and ECOSYSTEM types
+				if rangeType != "SEMVER" && rangeType != "ECOSYSTEM" {
+					continue
+				}
+
+				events, ok := rangeObj["events"].([]interface{})
+				if !ok || len(events) == 0 {
+					continue
+				}
+
+				var introduced, fixed, lastAffected *string
+				var introducedPadded, fixedPadded, lastAffectedPadded *string
+
+				// Parse events
+				for _, eventItem := range events {
+					eventObj, ok := eventItem.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					if intro, ok := eventObj["introduced"].(string); ok {
+						introduced = &intro
+						if padded := padSemver(intro); padded != "" {
+							introducedPadded = &padded
+						}
+					}
+					if fix, ok := eventObj["fixed"].(string); ok {
+						fixed = &fix
+						if padded := padSemver(fix); padded != "" {
+							fixedPadded = &padded
+						}
+					}
+					if last, ok := eventObj["last_affected"].(string); ok {
+						lastAffected = &last
+						if padded := padSemver(last); padded != "" {
+							lastAffectedPadded = &padded
+						}
+					}
+				}
+
+				// Only store ranges with both lower and upper bounds
+				// This matches the logic in IsVersionAffected
+				hasLowerBound := introduced != nil
+				hasUpperBound := fixed != nil || lastAffected != nil
+
+				if hasLowerBound && hasUpperBound {
+					affectedVersions.Ranges = append(affectedVersions.Ranges, SimplifiedRange{
+						Ecosystem:          ecosystem,
+						Type:               rangeType,
+						Introduced:         introduced,
+						Fixed:              fixed,
+						LastAffected:       lastAffected,
+						IntroducedPadded:   introducedPadded,
+						FixedPadded:        fixedPadded,
+						LastAffectedPadded: lastAffectedPadded,
+					})
+				}
+			}
+		}
+
+		affectedVersionsMap[basePurl] = affectedVersions
+	}
+
+	// Convert set to slice
+	var affectedPurls []string
+	for purl := range affectedPurlSet {
+		affectedPurls = append(affectedPurls, purl)
+	}
+
+	// Add denormalized fields to the CVE document
+	content["affected_package_purls"] = affectedPurls
+	content["affected_versions_map"] = affectedVersionsMap
+
+	logger.Sugar().Debugf("Added denormalized version data for CVE %s: %d packages",
+		content["_key"], len(affectedPurls))
 }
 
 // unpackAndLoad
@@ -395,6 +653,9 @@ func newVuln(vulnJSON string) error {
 
 	// CRITICAL: Add calculated CVSS scores before storing
 	addCVSSScoresToContent(content)
+
+	// CRITICAL: Add denormalized version data for fast querying
+	addDenormalizedVersionData(content)
 
 	// UPSERT the CVE document
 	query := `
