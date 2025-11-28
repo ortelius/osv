@@ -33,6 +33,21 @@ type cveText struct {
 	Description string `json:"cvetext"`
 }
 
+// SimplifiedRange represents a flattened version range for fast querying
+type SimplifiedRange struct {
+	Ecosystem    string  `json:"ecosystem"`
+	Type         string  `json:"type"`
+	Introduced   *string `json:"introduced,omitempty"`
+	Fixed        *string `json:"fixed,omitempty"`
+	LastAffected *string `json:"last_affected,omitempty"`
+}
+
+// AffectedVersions groups all version information for a specific package
+type AffectedVersions struct {
+	ExactVersions []string          `json:"exact_versions,omitempty"`
+	Ranges        []SimplifiedRange `json:"ranges,omitempty"`
+}
+
 var logger = database.InitLogger()
 var dbconn = database.InitializeDatabase()
 
@@ -150,6 +165,149 @@ func getSeverityRating(score float64) string {
 		return "HIGH"
 	}
 	return "CRITICAL"
+}
+
+// addDenormalizedVersionData adds pre-computed version data for fast AQL querying
+// This enables database-side filtering instead of returning 10,000+ rows to Go
+func addDenormalizedVersionData(content map[string]interface{}) {
+	affected, ok := content["affected"].([]interface{})
+	if !ok || len(affected) == 0 {
+		return
+	}
+
+	affectedPurlSet := make(map[string]bool)
+	affectedVersionsMap := make(map[string]AffectedVersions)
+
+	for _, affectedItem := range affected {
+		affectedObj, ok := affectedItem.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get package info
+		packageInfo, ok := affectedObj["package"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Build base PURL
+		basePurl := ""
+		if purl, ok := packageInfo["purl"].(string); ok && purl != "" {
+			// Clean and get base PURL
+			cleanedPurl, err := util.CleanPURL(purl)
+			if err != nil {
+				logger.Sugar().Warnf("Failed to parse PURL %s: %v", purl, err)
+				continue
+			}
+			basePurl, err = util.GetBasePURL(cleanedPurl)
+			if err != nil {
+				logger.Sugar().Warnf("Failed to get base PURL from %s: %v", cleanedPurl, err)
+				continue
+			}
+		} else if ecosystem, eok := packageInfo["ecosystem"].(string); eok {
+			if name, nok := packageInfo["name"].(string); nok {
+				purlType := util.EcosystemToPurlType(ecosystem)
+				if purlType != "" {
+					basePurl = fmt.Sprintf("pkg:%s/%s", purlType, name)
+				}
+			}
+		}
+
+		if basePurl == "" {
+			continue
+		}
+
+		affectedPurlSet[basePurl] = true
+
+		// Get or create entry for this PURL
+		affectedVersions := affectedVersionsMap[basePurl]
+
+		// Process exact versions
+		if versions, ok := affectedObj["versions"].([]interface{}); ok && len(versions) > 0 {
+			for _, v := range versions {
+				if vStr, ok := v.(string); ok {
+					affectedVersions.ExactVersions = append(affectedVersions.ExactVersions, vStr)
+				}
+			}
+		}
+
+		// Process ranges
+		if ranges, ok := affectedObj["ranges"].([]interface{}); ok && len(ranges) > 0 {
+			ecosystem := ""
+			if e, ok := packageInfo["ecosystem"].(string); ok {
+				ecosystem = e
+			}
+
+			for _, rangeItem := range ranges {
+				rangeObj, ok := rangeItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				rangeType, _ := rangeObj["type"].(string)
+
+				// Only process SEMVER and ECOSYSTEM types
+				if rangeType != "SEMVER" && rangeType != "ECOSYSTEM" {
+					continue
+				}
+
+				events, ok := rangeObj["events"].([]interface{})
+				if !ok || len(events) == 0 {
+					continue
+				}
+
+				var introduced, fixed, lastAffected *string
+
+				// Parse events
+				for _, eventItem := range events {
+					eventObj, ok := eventItem.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					if intro, ok := eventObj["introduced"].(string); ok {
+						introduced = &intro
+					}
+					if fix, ok := eventObj["fixed"].(string); ok {
+						fixed = &fix
+					}
+					if last, ok := eventObj["last_affected"].(string); ok {
+						lastAffected = &last
+					}
+				}
+
+				// Only store ranges with both lower and upper bounds
+				// This matches the logic in IsVersionAffected
+				hasLowerBound := introduced != nil
+				hasUpperBound := fixed != nil || lastAffected != nil
+
+				if hasLowerBound && hasUpperBound {
+					affectedVersions.Ranges = append(affectedVersions.Ranges, SimplifiedRange{
+						Ecosystem:    ecosystem,
+						Type:         rangeType,
+						Introduced:   introduced,
+						Fixed:        fixed,
+						LastAffected: lastAffected,
+					})
+				}
+			}
+		}
+
+		affectedVersionsMap[basePurl] = affectedVersions
+	}
+
+	// Convert set to slice
+	var affectedPurls []string
+	for purl := range affectedPurlSet {
+		affectedPurls = append(affectedPurls, purl)
+	}
+
+	// Add denormalized fields to the CVE document
+	content["affected_package_purls"] = affectedPurls
+	content["affected_versions_map"] = affectedVersionsMap
+
+	logger.Sugar().Debugf("Added denormalized version data for CVE %s: %d packages",
+		content["_key"], len(affectedPurls))
 }
 
 // unpackAndLoad
@@ -395,6 +553,9 @@ func newVuln(vulnJSON string) error {
 
 	// CRITICAL: Add calculated CVSS scores before storing
 	addCVSSScoresToContent(content)
+
+	// CRITICAL: Add denormalized version data for fast querying
+	addDenormalizedVersionData(content)
 
 	// UPSERT the CVE document
 	query := `
