@@ -5,7 +5,7 @@ go 1.25.4
 require (
 	github.com/arangodb/go-driver/v2 v2.1.6
 	github.com/google/osv-scanner v1.9.2
-	github.com/ortelius/pdvd-backend/v12 v12.0.66
+	github.com/ortelius/pdvd-backend/v12 v12.0.75
 	github.com/pandatix/go-cvss v0.6.2
 )
 

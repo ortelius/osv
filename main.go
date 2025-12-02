@@ -12,8 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
+	"time"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
 	"github.com/google/osv-scanner/pkg/models"
@@ -25,59 +25,39 @@ import (
 	gocvss40 "github.com/pandatix/go-cvss/40"
 )
 
-// vulnID holds basic vulnerability identification information
-type vulnID struct {
-	ID       string `json:"id"`
-	Modified string `json:"modified"`
-}
-
-// cveText holds vulnerability description for MITRE mapping
-type cveText struct {
-	Description string `json:"cvetext"`
-}
-
 var logger = database.InitLogger()
 var dbconn = database.InitializeDatabase()
 
-// getMitreURL retrieves the MITRE mapping URL from environment
-func getMitreURL() string {
-	// Get the environment variable value for MITER_MAPPING_URL
-	mitreURL := os.Getenv("MITRE_MAPPING_URL")
-	return mitreURL
+// EcosystemMetadata stores the high-water mark for imports
+type EcosystemMetadata struct {
+	Key          string `json:"_key"`          // e.g., "npm", "maven"
+	LastModified string `json:"last_modified"` // RFC3339 Timestamp
+	Type         string `json:"type"`          // "ecosystem_metadata"
 }
 
-// calculateCVSSScore calculates numeric base score from CVSS vector string
-// Returns 0 if unable to parse
+// ----------------------------------------------------------------------------
+// CVSS & Helper Functions
+// ----------------------------------------------------------------------------
+
 func calculateCVSSScore(vectorStr string) float64 {
 	if vectorStr == "" || !strings.HasPrefix(vectorStr, "CVSS:") {
 		return 0
 	}
-
 	if strings.HasPrefix(vectorStr, "CVSS:3.1") || strings.HasPrefix(vectorStr, "CVSS:3.0") {
-		cvss31, err := gocvss31.ParseVector(vectorStr)
-		if err == nil {
+		if cvss31, err := gocvss31.ParseVector(vectorStr); err == nil {
 			return cvss31.BaseScore()
 		}
-		logger.Sugar().Debugf("Failed to parse CVSS v3 vector %s: %v", vectorStr, err)
 	}
-
 	if strings.HasPrefix(vectorStr, "CVSS:4.0") {
-		cvss40, err := gocvss40.ParseVector(vectorStr)
-		if err == nil {
+		if cvss40, err := gocvss40.ParseVector(vectorStr); err == nil {
 			return cvss40.Score()
 		}
-		logger.Sugar().Debugf("Failed to parse CVSS v4 vector %s: %v", vectorStr, err)
 	}
-
 	return 0
 }
 
-// addCVSSScoresToContent adds calculated base scores to CVE content
-// Modifies the content map in place
-// If severity is null or no valid scores found, defaults to LOW (score: 0.1)
 func addCVSSScoresToContent(content map[string]interface{}) {
 	severity, ok := content["severity"].([]interface{})
-
 	var baseScores []float64
 	var highestScore float64
 	hasValidScore := false
@@ -88,20 +68,16 @@ func addCVSSScoresToContent(content map[string]interface{}) {
 			if !ok {
 				continue
 			}
-
 			scoreStr, ok := sevMap["score"].(string)
 			if !ok || scoreStr == "" {
 				continue
 			}
-
 			sevType, _ := sevMap["type"].(string)
-
 			if sevType == "CVSS_V3" || sevType == "CVSS_V4" {
 				baseScore := calculateCVSSScore(scoreStr)
 				if baseScore > 0 {
 					baseScores = append(baseScores, baseScore)
 					hasValidScore = true
-
 					if baseScore > highestScore {
 						highestScore = baseScore
 					}
@@ -113,27 +89,18 @@ func addCVSSScoresToContent(content map[string]interface{}) {
 	if !hasValidScore {
 		highestScore = 0.1
 		baseScores = []float64{0.1}
-		logger.Sugar().Debugf("CVE %s has no valid CVSS scores, defaulting to LOW (0.1)", content["_key"])
 	}
 
 	if content["database_specific"] == nil {
 		content["database_specific"] = make(map[string]interface{})
 	}
-
 	dbSpecific := content["database_specific"].(map[string]interface{})
 	dbSpecific["cvss_base_scores"] = baseScores
 	dbSpecific["cvss_base_score"] = highestScore
-
 	dbSpecific["severity_rating"] = getSeverityRating(highestScore)
-
 	content["database_specific"] = dbSpecific
-
-	if hasValidScore {
-		logger.Sugar().Debugf("Added CVSS scores to CVE %s: highest=%.1f", content["_key"], highestScore)
-	}
 }
 
-// getSeverityRating returns CVSS severity rating based on base score
 func getSeverityRating(score float64) string {
 	if score == 0 {
 		return "NONE"
@@ -147,78 +114,92 @@ func getSeverityRating(score float64) string {
 	return "CRITICAL"
 }
 
-// unpackAndLoad extracts and processes vulnerabilities from a zip archive
-func unpackAndLoad(src string) error {
+// ----------------------------------------------------------------------------
+// DB Logic
+// ----------------------------------------------------------------------------
 
-	fmt.Println(src)
-	r, err := zip.OpenReader(src)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := r.Close(); err != nil {
-			panic(err)
-		}
-	}()
+// SanitizeKey ensures the database key is valid
+// ArangoDB keys cannot contain spaces, slashes, or brackets
+func SanitizeKey(key string) string {
+	// 1. Trim whitespace/newlines first
+	key = strings.TrimSpace(key)
 
-	extractAndWriteFile := func(f *zip.File) error {
+	// 2. Use Replacer for cleaner, faster, multi-string replacement
+	// Replaces spaces and slashes with hyphens
+	// Removes brackets and parentheses entirely
+	replacer := strings.NewReplacer(
+		" ", "-",
+		"/", "-",
+		"[", "",
+		"]", "",
+		"(", "",
+		")", "",
+	)
 
-		if strings.Contains(f.Name, "/") {
-			return fmt.Errorf("%s: illegal file path", f.Name)
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := rc.Close(); err != nil {
-				panic(err)
-			}
-		}()
-
-		if !f.FileInfo().IsDir() {
-			var vulnJSON strings.Builder
-
-			_, err = io.Copy(&vulnJSON, rc)
-			if err != nil {
-				return err
-			}
-
-			var vulnIDMod vulnID
-			var vulnStr = vulnJSON.String()
-			if err := json.Unmarshal([]byte(vulnStr), &vulnIDMod); err != nil {
-				logger.Sugar().Infoln(err)
-			}
-
-			if err := newVuln(vulnStr); err != nil {
-				logger.Sugar().Infoln(err)
-				logger.Sugar().Infoln(vulnStr)
-			}
-		}
-		return nil
-	}
-
-	for _, f := range r.File {
-		err := extractAndWriteFile(f)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return replacer.Replace(key)
 }
 
-// LoadFromOSVDev retrieves the vulns from osv.dev and adds them to the Arangodb
-func LoadFromOSVDev() {
+// GetLastRun retrieves the timestamp of the last successful import for an ecosystem
+func GetLastRun(ecosystem string) (time.Time, error) {
+	key := SanitizeKey(ecosystem)
+	if key == "" {
+		return time.Time{}, nil
+	}
 
+	ctx := context.Background()
+	query := `RETURN DOCUMENT("metadata", @key)`
+	bindVars := map[string]interface{}{"key": key}
+
+	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
+	if err != nil {
+		return time.Time{}, nil
+	}
+	defer cursor.Close()
+
+	var meta EcosystemMetadata
+	if _, err := cursor.ReadDocument(ctx, &meta); err != nil {
+		return time.Time{}, nil
+	}
+
+	return time.Parse(time.RFC3339, meta.LastModified)
+}
+
+// SaveLastRun updates the timestamp after a successful import
+func SaveLastRun(ecosystem string, lastModified time.Time) error {
+	key := SanitizeKey(ecosystem)
+
+	// Final safety check to prevent empty keys
+	if key == "" {
+		return fmt.Errorf("cannot save last run for empty ecosystem key (original: %s)", ecosystem)
+	}
+
+	ctx := context.Background()
+	query := `
+		UPSERT { _key: @key }
+		INSERT { _key: @key, last_modified: @time, type: "ecosystem_metadata" }
+		UPDATE { last_modified: @time }
+		IN metadata
+	`
+
+	bindVars := map[string]interface{}{
+		"key":  key,
+		"time": lastModified.Format(time.RFC3339),
+	}
+
+	_, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
+	return err
+}
+
+// ----------------------------------------------------------------------------
+// Main Import Logic
+// ----------------------------------------------------------------------------
+
+func LoadFromOSVDev() {
 	baseURL := "https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/ecosystems.txt?alt=media"
 
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false,
-			MinVersion:         tls.VersionTLS12,
-		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: false, MinVersion: tls.VersionTLS12},
+		MaxIdleConns:    100,
 	}
 	client := &http.Client{Transport: tr}
 
@@ -226,266 +207,199 @@ func LoadFromOSVDev() {
 	if err != nil {
 		logger.Sugar().Fatal(err)
 	}
+	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Sugar().Fatalln(err)
 	}
-	resp.Body.Close()
 
-	ecosystems := strings.Split(string(body), "\n")
+	// Split by newline
+	lines := strings.Split(string(body), "\n")
 
-	for _, platform := range ecosystems {
-		if len(strings.TrimSpace(platform)) == 0 {
+	// SERIAL EXECUTION: Loop through lines one by one
+	for _, line := range lines {
+		// CRITICAL FIX: Trim whitespace/carriage returns (\r) BEFORE using the string
+		platform := strings.TrimSpace(line)
+
+		if len(platform) == 0 {
 			continue
 		}
 
-		url := fmt.Sprintf("https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/%s%%2Fall.zip?alt=media", url.PathEscape(platform))
-
-		if resp, err := client.Get(url); err == nil {
-			filename := fmt.Sprintf("%s.zip", platform)
-			if out, err := os.Create(filename); err == nil {
-				if _, err := io.Copy(out, resp.Body); err != nil {
-					logger.Sugar().Infoln(err)
-				}
-				out.Close()
-			} else {
-				logger.Sugar().Infoln(err)
-			}
-
-			if err := unpackAndLoad(filename); err != nil {
-				logger.Sugar().Infoln(err)
-				logger.Sugar().Fatalln(filename)
-			}
-			os.Remove(filename)
-			resp.Body.Close()
-		} else {
-			logger.Sugar().Infoln(err)
-		}
+		processEcosystem(client, platform)
 	}
 }
 
-// newVuln godoc
-// @Summary Create a Vulnerability
-// @Description Create a new Vulnerability and persist it with version-aware edges
-// @Tags vulnerability
-// This function processes CVE/OSV data and creates hub-and-spoke relationships using:
-// - One CVE document in the 'cve' collection
-// - Multiple PURL hub documents in the 'purl' collection (one per unique package)
-// - Multiple cve2purl edges with parsed version boundaries for indexed filtering
-//
-// CRITICAL: Handles CVEs with multiple affected entries and multiple ranges per entry
-// Example: A CVE affecting package versions 0-19.2.16, 20.0.0-20.3.14, and 21.0.0-21.0.1
-// will create THREE separate edges, one for each range, enabling accurate version filtering
-func newVuln(vulnJSON string) error {
-	var existsCursor arangodb.Cursor
-	var err error
+func processEcosystem(client *http.Client, platform string) {
+	// 1. Get High Water Mark from database
+	lastRunTime, _ := GetLastRun(platform)
+	logger.Sugar().Infof("Processing %s. Skipping items older than: %v", platform, lastRunTime)
+
+	urlStr := fmt.Sprintf("https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/%s%%2Fall.zip?alt=media", url.PathEscape(platform))
+
+	resp, err := client.Get(urlStr)
+	if err != nil {
+		logger.Sugar().Errorf("Failed to download %s: %v", platform, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Sugar().Errorf("Failed to read body for %s: %v", platform, err)
+		return
+	}
+
+	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		logger.Sugar().Errorf("Failed to open zip reader for %s: %v", platform, err)
+		return
+	}
+
+	var maxSeenTime time.Time = lastRunTime
+
+	// SERIAL EXECUTION: Loop through zip files one by one
+	for _, f := range zipReader.File {
+		if f.FileInfo().IsDir() || strings.Contains(f.Name, "/") {
+			continue
+		}
+
+		// Use anonymous function to ensure 'defer rc.Close()' runs immediately after file processing,
+		// preventing file descriptor exhaustion in a serial loop.
+		func() {
+			rc, err := f.Open()
+			if err != nil {
+				return
+			}
+			defer rc.Close()
+
+			var content map[string]interface{}
+			if err := json.NewDecoder(rc).Decode(&content); err != nil {
+				return
+			}
+
+			// 2. CHECK TIMESTAMP (Optimization)
+			modStr, _ := content["modified"].(string)
+			if modStr != "" {
+				modTime, err := time.Parse(time.RFC3339, modStr)
+				if err == nil {
+					// Update maxSeenTime (No Mutex needed in serial mode)
+					if modTime.After(maxSeenTime) {
+						maxSeenTime = modTime
+					}
+
+					// If this vuln is older than our last run, SKIP IT
+					if !modTime.After(lastRunTime) {
+						return
+					}
+				}
+			}
+
+			// 3. Process if new
+			if err := newVuln(content); err != nil {
+				logger.Sugar().Debugf("Error processing %s: %v", f.Name, err)
+			}
+		}()
+	}
+
+	// 4. Save High Water Mark to database
+	// Default to NOW if no new timestamps were found
+	if maxSeenTime.IsZero() {
+		maxSeenTime = time.Now().UTC()
+	}
+
+	if maxSeenTime.After(lastRunTime) {
+		if err := SaveLastRun(platform, maxSeenTime); err != nil {
+			logger.Sugar().Errorf("Failed to save high water mark for %s: %v", platform, err)
+		} else {
+			logger.Sugar().Infof("Completed %s. New High Water Mark: %v", platform, maxSeenTime)
+		}
+	} else {
+		logger.Sugar().Infof("Completed %s. No new data.", platform)
+	}
+}
+
+// newVuln persists the vulnerability
+func newVuln(content map[string]interface{}) error {
 	var ctx = context.Background()
 
-	var content map[string]interface{}
-
-	if err = json.Unmarshal([]byte(vulnJSON), &content); err != nil {
-		logger.Sugar().Errorf("Failed to unmarshal vuln JSON: %v", err)
-		return err
-	}
-
-	if id, ok := content["id"].(string); ok && id != "" {
-		content["_key"] = strings.ReplaceAll(id, " ", "-")
-	} else {
-		logger.Sugar().Errorf("Document is missing a valid 'id' field to use as _key: %v", vulnJSON)
+	id, ok := content["id"].(string)
+	if !ok || id == "" {
 		return nil
 	}
 
-	parameters := map[string]interface{}{
-		"key": content["_key"],
-	}
+	content["_key"] = strings.ReplaceAll(id, " ", "-")
+	key := content["_key"]
 
-	aql := `FOR vuln in cve
-			FILTER vuln._key == @key
-			RETURN vuln.modified`
+	// Double-check existence in DB
+	modDate, _ := content["modified"].(string)
+	parameters := map[string]interface{}{"key": key}
+	aql := `FOR vuln in cve FILTER vuln._key == @key RETURN vuln.modified`
 
-	if existsCursor, err = dbconn.Database.Query(ctx, aql, &arangodb.QueryOptions{BindVars: parameters}); err != nil {
-		logger.Sugar().Errorf("Failed to run query: %v", err)
-	}
-
-	defer existsCursor.Close()
-
-	moddate := ""
-
-	if existsCursor.HasMore() {
-		if _, err = existsCursor.ReadDocument(ctx, &moddate); err != nil {
-			logger.Sugar().Errorf("Failed to read document: %v", err)
+	cursor, err := dbconn.Database.Query(ctx, aql, &arangodb.QueryOptions{BindVars: parameters})
+	if err == nil {
+		defer cursor.Close()
+		if cursor.HasMore() {
+			var existingMod string
+			if _, err := cursor.ReadDocument(ctx, &existingMod); err == nil {
+				if existingMod == modDate {
+					return nil // Exact match exists
+				}
+			}
 		}
 	}
-
-	if content["modified"] == moddate {
-		return nil
-	}
-
-	combinedJSON := vulnJSON
 
 	if _, exists := content["affected"]; !exists {
 		return nil
 	}
 
-	summary := ""
-	details := ""
-
-	if val, ok := content["summary"]; ok {
-		if s, ok := val.(string); ok {
-			summary = s
-		}
-	}
-
-	if val, ok := content["details"]; ok {
-		if d, ok := val.(string); ok {
-			details = d
-		}
-	}
-
-	cve := cveText{
-		Description: summary + " " + details,
-	}
-
-	jsonData, err := json.Marshal(cve)
-	if err != nil {
-		logger.Sugar().Errorln("Error marshaling JSON:", err)
-		return err
-	}
-
-	mitreURL := getMitreURL()
-
-	if len(mitreURL) > 0 {
-		resp, err := http.Post(mitreURL, "application/json", bytes.NewBuffer(jsonData))
-		if err == nil {
-			defer resp.Body.Close()
-
-			if resp.StatusCode == 200 {
-				if body, err := io.ReadAll(resp.Body); err == nil {
-					techniqueJSON := ", \"techniques\":" + string(body)
-					lastBraceIndex := strings.LastIndex(vulnJSON, "}")
-					if lastBraceIndex != -1 {
-						combinedJSON = vulnJSON[:lastBraceIndex] + techniqueJSON + "}"
-					}
-
-					combinedJSON = strings.Replace(combinedJSON, "\"id\":", "\"_key\":", 1)
-				}
-			}
-		} else {
-			logger.Sugar().Errorln("Error sending POST request:", err)
-		}
-	}
-
-	if err := json.Unmarshal([]byte(combinedJSON), &content); err != nil {
-		logger.Sugar().Infoln(err)
-	}
-
-	key := content["_key"]
-
-	if key == "" {
-		logger.Sugar().Errorf("Document is missing a `_key` field for UPSERT: %v", content)
-		return nil
-	}
-
 	content["objtype"] = "CVE"
-
 	addCVSSScoresToContent(content)
 
-	query := `
-		UPSERT { _key: @key }
-		INSERT @doc
-		UPDATE @doc
-		IN cve
-	`
+	query := `UPSERT { _key: @key } INSERT @doc UPDATE @doc IN cve`
+	bindVars := map[string]interface{}{"key": key, "doc": content}
 
-	bindVars := map[string]interface{}{
-		"key": key,
-		"doc": content,
-	}
-
-	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
-	if err != nil {
-		logger.Sugar().Errorf("AQL UPSERT failed for key '%s': %v", key, err)
+	if _, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars}); err != nil {
 		return err
 	}
-	cursor.Close()
 
-	// ============================================================================
-	// CRITICAL SECTION: Multi-Range Edge Creation
-	// ============================================================================
-	// This section processes CVE vulnerability ranges and creates version-aware edges.
-	//
-	// IMPORTANT: CVEs can have multiple affected entries (e.g., one CVE affecting
-	// multiple version ranges like 0-19.x, 20.x-20.3.x, 21.0.x-21.0.y).
-	// Each affected entry and each range within an entry creates a SEPARATE edge.
-	//
-	// Example CVE structure:
-	// {
-	//   "affected": [
-	//     { "package": "pkg:npm/@angular/common", "ranges": [{"introduced": "0", "fixed": "19.2.16"}] },
-	//     { "package": "pkg:npm/@angular/common", "ranges": [{"introduced": "20.0.0", "fixed": "20.3.14"}] },
-	//     { "package": "pkg:npm/@angular/common", "ranges": [{"introduced": "21.0.0", "fixed": "21.0.1"}] }
-	//   ]
-	// }
-	//
-	// This creates THREE edges, enabling the AQL query to match versions in ANY of these ranges
-	// using indexed numeric comparison instead of expensive Go validation.
-	// ============================================================================
+	return processEdges(ctx, content)
+}
 
-	// EdgeCandidate represents one complete version range for edge creation
-	// Each candidate will become a separate cve2purl edge in the database
+func processEdges(ctx context.Context, content map[string]interface{}) error {
 	type EdgeCandidate struct {
-		BasePurl          string // Base PURL without version (e.g., pkg:npm/@angular/common)
-		Ecosystem         string // Package ecosystem (npm, pypi, maven, etc.)
-		IntroducedMajor   *int   // Introduced version major component
-		IntroducedMinor   *int   // Introduced version minor component
-		IntroducedPatch   *int   // Introduced version patch component
-		FixedMajor        *int   // Fixed version major component
-		FixedMinor        *int   // Fixed version minor component
-		FixedPatch        *int   // Fixed version patch component
-		LastAffectedMajor *int   // Last affected version major component (alternative to fixed)
-		LastAffectedMinor *int   // Last affected version minor component
-		LastAffectedPatch *int   // Last affected version patch component
+		BasePurl, Ecosystem                                     string
+		IntroducedMajor, IntroducedMinor, IntroducedPatch       *int
+		FixedMajor, FixedMinor, FixedPatch                      *int
+		LastAffectedMajor, LastAffectedMinor, LastAffectedPatch *int
 	}
 
 	var edgeCandidates []EdgeCandidate
 	uniqueBasePurls := make(map[string]bool)
 
-	// CRITICAL FIX: Process each affected entry and each range separately
-	// This handles CVEs with multiple affected entries (like GHSA-58c5-g7wp-6w37)
-	// and CVEs with multiple ranges per affected entry
 	if affected, ok := content["affected"].([]interface{}); ok {
 		for _, aff := range affected {
 			var affectedData models.Affected
 			affBytes, _ := json.Marshal(aff)
 			json.Unmarshal(affBytes, &affectedData)
 
-			var basePurl string
-			var ecosystem string
-
+			var basePurl, ecosystem string
 			if affMap, ok := aff.(map[string]interface{}); ok {
 				if pkg, ok := affMap["package"].(map[string]interface{}); ok {
 					if purlStr, ok := pkg["purl"].(string); ok && purlStr != "" {
-						cleanedPurl, err := util.CleanPURL(purlStr)
-						if err != nil {
-							logger.Sugar().Warnf("Failed to parse PURL %s: %v", purlStr, err)
-							continue
-						}
-						basePurl, err = util.GetBasePURL(cleanedPurl)
-						if err != nil {
-							logger.Sugar().Warnf("Failed to get base PURL from %s: %v", cleanedPurl, err)
-							continue
-						}
-						parsed, _ := util.ParsePURL(cleanedPurl)
-						ecosystem = parsed.Type
-					} else {
-						if ecosystemStr, ok := pkg["ecosystem"].(string); ok {
-							if name, ok := pkg["name"].(string); ok {
-								purlType := util.EcosystemToPurlType(ecosystemStr)
-								if purlType != "" {
-									basePurl = fmt.Sprintf("pkg:%s/%s", purlType, name)
-									ecosystem = purlType
+						if cleanedPurl, err := util.CleanPURL(purlStr); err == nil {
+							if bp, err := util.GetBasePURL(cleanedPurl); err == nil {
+								basePurl = bp
+								if parsed, err := util.ParsePURL(cleanedPurl); err == nil {
+									ecosystem = parsed.Type
 								}
+							}
+						}
+					} else if eco, ok := pkg["ecosystem"].(string); ok {
+						if name, ok := pkg["name"].(string); ok {
+							if pt := util.EcosystemToPurlType(eco); pt != "" {
+								basePurl = fmt.Sprintf("pkg:%s/%s", pt, name)
+								ecosystem = pt
 							}
 						}
 					}
@@ -495,21 +409,13 @@ func newVuln(vulnJSON string) error {
 			if basePurl == "" {
 				continue
 			}
-
 			uniqueBasePurls[basePurl] = true
 
-			// Process EACH range in this affected entry
-			// This is critical for CVEs with multiple version ranges
 			for _, vrange := range affectedData.Ranges {
 				if vrange.Type != models.RangeEcosystem && vrange.Type != models.RangeSemVer {
 					continue
 				}
-
-				// Extract version boundaries for THIS specific range
-				// Note: We do NOT use "introduced == nil" checks here, allowing
-				// multiple ranges to be processed independently
 				var introduced, fixed, lastAffected *util.ParsedVersion
-
 				for _, event := range vrange.Events {
 					if event.Introduced != "" {
 						introduced = util.ParseSemanticVersion(event.Introduced)
@@ -522,176 +428,110 @@ func newVuln(vulnJSON string) error {
 					}
 				}
 
-				// Create a separate edge candidate for this range
-				// This ensures each version range gets its own indexed edge for AQL filtering
-				candidate := EdgeCandidate{
-					BasePurl:  basePurl,
-					Ecosystem: ecosystem,
-				}
-
+				candidate := EdgeCandidate{BasePurl: basePurl, Ecosystem: ecosystem}
 				if introduced != nil {
 					candidate.IntroducedMajor = introduced.Major
 					candidate.IntroducedMinor = introduced.Minor
 					candidate.IntroducedPatch = introduced.Patch
 				}
-
 				if fixed != nil {
 					candidate.FixedMajor = fixed.Major
 					candidate.FixedMinor = fixed.Minor
 					candidate.FixedPatch = fixed.Patch
 				}
-
 				if lastAffected != nil {
 					candidate.LastAffectedMajor = lastAffected.Major
 					candidate.LastAffectedMinor = lastAffected.Minor
 					candidate.LastAffectedPatch = lastAffected.Patch
 				}
-
 				edgeCandidates = append(edgeCandidates, candidate)
 			}
 		}
 	}
 
-	if len(edgeCandidates) > 0 {
-		// Convert unique PURLs map to slice
-		var basePurls []string
-		for basePurl := range uniqueBasePurls {
-			basePurls = append(basePurls, basePurl)
+	if len(edgeCandidates) == 0 {
+		return nil
+	}
+
+	var basePurls []string
+	for p := range uniqueBasePurls {
+		basePurls = append(basePurls, p)
+	}
+
+	// Bulk PURL Upsert
+	purlAql := `
+		FOR purl IN @purls
+			LET upserted = FIRST(
+				UPSERT { purl: purl }
+				INSERT { purl: purl, objtype: "PURL" }
+				UPDATE {} IN purl
+				RETURN NEW
+			)
+			RETURN { purl: purl, key: upserted._key }
+	`
+	cursor, err := dbconn.Database.Query(ctx, purlAql, &arangodb.QueryOptions{BindVars: map[string]interface{}{"purls": basePurls}})
+	if err != nil {
+		return err
+	}
+	defer cursor.Close()
+
+	purlKeyMap := make(map[string]string)
+	for cursor.HasMore() {
+		var res struct{ Purl, Key string }
+		if _, err := cursor.ReadDocument(ctx, &res); err == nil {
+			purlKeyMap[res.Purl] = res.Key
 		}
+	}
 
-		// Upsert all unique PURLs and get their keys
-		// This creates or retrieves PURL hub documents for the hub-and-spoke pattern
-		aql = `
-			FOR purl IN @purls
-				LET upsertedPurl = FIRST(
-					UPSERT { purl: purl }
-					INSERT { purl: purl, objtype: "PURL" }
-					UPDATE {} IN purl
-					RETURN NEW
-				)
-				RETURN {
-					purl: purl,
-					key: upsertedPurl._key
-				}
-		`
-
-		parameters = map[string]interface{}{
-			"purls": basePurls,
-		}
-
-		cursor, err = dbconn.Database.Query(ctx, aql, &arangodb.QueryOptions{BindVars: parameters})
-		if err != nil {
-			logger.Sugar().Errorf("Failed to execute PURL upsert query: %v", err)
-			return err
-		}
-
-		purlKeyMap := make(map[string]string)
-		for cursor.HasMore() {
-			var result struct {
-				Purl string `json:"purl"`
-				Key  string `json:"key"`
-			}
-			_, err := cursor.ReadDocument(ctx, &result)
-			if err != nil {
-				continue
-			}
-			purlKeyMap[result.Purl] = result.Key
-		}
-		cursor.Close()
-
-		// Create edges for all candidates
-		// Each candidate becomes a separate cve2purl edge with version boundaries
-		// This allows AQL queries to use indexed numeric comparison for version filtering
-		var edges []map[string]interface{}
-		for _, candidate := range edgeCandidates {
-			purlKey, exists := purlKeyMap[candidate.BasePurl]
-			if !exists {
-				logger.Sugar().Warnf("PURL key not found for %s", candidate.BasePurl)
-				continue
-			}
-
+	var edges []map[string]interface{}
+	for _, c := range edgeCandidates {
+		if pKey, ok := purlKeyMap[c.BasePurl]; ok {
 			edge := map[string]interface{}{
 				"_from": fmt.Sprintf("cve/%s", content["_key"]),
-				"_to":   fmt.Sprintf("purl/%s", purlKey),
+				"_to":   fmt.Sprintf("purl/%s", pKey),
 			}
-
-			if candidate.Ecosystem != "" {
-				edge["ecosystem"] = candidate.Ecosystem
+			if c.Ecosystem != "" {
+				edge["ecosystem"] = c.Ecosystem
 			}
-
-			// Store parsed version components for indexed filtering in AQL
-			if candidate.IntroducedMajor != nil {
-				edge["introduced_major"] = *candidate.IntroducedMajor
+			if c.IntroducedMajor != nil {
+				edge["introduced_major"] = *c.IntroducedMajor
 			}
-			if candidate.IntroducedMinor != nil {
-				edge["introduced_minor"] = *candidate.IntroducedMinor
+			if c.IntroducedMinor != nil {
+				edge["introduced_minor"] = *c.IntroducedMinor
 			}
-			if candidate.IntroducedPatch != nil {
-				edge["introduced_patch"] = *candidate.IntroducedPatch
+			if c.IntroducedPatch != nil {
+				edge["introduced_patch"] = *c.IntroducedPatch
 			}
-
-			if candidate.FixedMajor != nil {
-				edge["fixed_major"] = *candidate.FixedMajor
+			if c.FixedMajor != nil {
+				edge["fixed_major"] = *c.FixedMajor
 			}
-			if candidate.FixedMinor != nil {
-				edge["fixed_minor"] = *candidate.FixedMinor
+			if c.FixedMinor != nil {
+				edge["fixed_minor"] = *c.FixedMinor
 			}
-			if candidate.FixedPatch != nil {
-				edge["fixed_patch"] = *candidate.FixedPatch
+			if c.FixedPatch != nil {
+				edge["fixed_patch"] = *c.FixedPatch
 			}
-
-			if candidate.LastAffectedMajor != nil {
-				edge["last_affected_major"] = *candidate.LastAffectedMajor
+			if c.LastAffectedMajor != nil {
+				edge["last_affected_major"] = *c.LastAffectedMajor
 			}
-			if candidate.LastAffectedMinor != nil {
-				edge["last_affected_minor"] = *candidate.LastAffectedMinor
+			if c.LastAffectedMinor != nil {
+				edge["last_affected_minor"] = *c.LastAffectedMinor
 			}
-			if candidate.LastAffectedPatch != nil {
-				edge["last_affected_patch"] = *candidate.LastAffectedPatch
+			if c.LastAffectedPatch != nil {
+				edge["last_affected_patch"] = *c.LastAffectedPatch
 			}
-
 			edges = append(edges, edge)
 		}
+	}
 
-		if len(edges) > 0 {
-			// Delete existing edges for this CVE to ensure clean state
-			// This handles CVE updates where the affected versions change
-			// Uses delete-then-insert pattern to avoid duplicate edge conflicts
-			deleteQuery := `
-				FOR edge IN cve2purl
-					FILTER edge._from == @cveId
-					REMOVE edge IN cve2purl
-			`
-			deleteCursor, err := dbconn.Database.Query(ctx, deleteQuery, &arangodb.QueryOptions{
-				BindVars: map[string]interface{}{
-					"cveId": fmt.Sprintf("cve/%s", content["_key"]),
-				},
-			})
-			if err != nil {
-				logger.Sugar().Warnf("Failed to delete old edges for CVE %s: %v", content["_key"], err)
-			} else {
-				deleteCursor.Close()
-			}
+	if len(edges) > 0 {
+		// Delete old edges
+		delQ := `FOR edge IN cve2purl FILTER edge._from == @cveId REMOVE edge IN cve2purl`
+		dbconn.Database.Query(ctx, delQ, &arangodb.QueryOptions{BindVars: map[string]interface{}{"cveId": fmt.Sprintf("cve/%s", content["_key"])}})
 
-			// Insert all new edges in a single batch operation
-			// This creates one edge per version range, enabling indexed AQL filtering
-			insertQuery := `
-				FOR edge IN @edges
-					INSERT edge INTO cve2purl
-			`
-			insertCursor, err := dbconn.Database.Query(ctx, insertQuery, &arangodb.QueryOptions{
-				BindVars: map[string]interface{}{
-					"edges": edges,
-				},
-			})
-			if err != nil {
-				logger.Sugar().Errorf("Failed to insert edges: %v", err)
-				return err
-			}
-			insertCursor.Close()
-
-			logger.Sugar().Debugf("Created %d cve2purl edges for CVE %s", len(edges), content["_key"])
-		}
+		// Insert new edges
+		insQ := `FOR edge IN @edges INSERT edge INTO cve2purl`
+		dbconn.Database.Query(ctx, insQ, &arangodb.QueryOptions{BindVars: map[string]interface{}{"edges": edges}})
 	}
 
 	return nil
