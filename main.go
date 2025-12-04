@@ -233,7 +233,6 @@ func LoadFromOSVDev() {
 func processEcosystem(client *http.Client, platform string) {
 	// 1. Get High Water Mark from database
 	lastRunTime, _ := GetLastRun(platform)
-	logger.Sugar().Infof("Processing %s. Skipping items older than: %v", platform, lastRunTime)
 
 	urlStr := fmt.Sprintf("https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/%s%%2Fall.zip?alt=media", url.PathEscape(platform))
 
@@ -317,7 +316,7 @@ func processEcosystem(client *http.Client, platform string) {
 		if err := SaveLastRun(platform, maxSeenTime); err != nil {
 			logger.Sugar().Errorf("Failed to save high water mark for %s: %v", platform, err)
 		} else {
-			logger.Sugar().Infof("Completed %s. Added/Updated %d vulnerabilities. New High Water Mark: %v", platform, cveCount, maxSeenTime)
+			logger.Sugar().Infof("Completed %s. Added/Updated %d vulnerabilities since %v. New High Water Mark: %v", platform, cveCount, lastRunTime, maxSeenTime)
 		}
 	} else {
 		logger.Sugar().Infof("Completed %s. No new data.", platform)
