@@ -127,8 +127,6 @@ func SanitizeKey(key string) string {
 	key = strings.TrimSpace(key)
 
 	// 2. Use Replacer for cleaner, faster, multi-string replacement
-	// Replaces spaces and slashes with hyphens
-	// Removes brackets and parentheses entirely
 	replacer := strings.NewReplacer(
 		" ", "-",
 		"/", "-",
