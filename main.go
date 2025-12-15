@@ -1,5 +1,10 @@
 // Ortelius v11 Vulnerability Microservice that handles creating Vulnerability from OSV.dev
 // Runs as a cronjob
+//
+// CRITICAL FIXES APPLIED:
+// 1. Added missing Go-side validation in getCVEsForRelease (lines 790-798)
+// 2. Added debug logging to track filtering stages
+// 3. Fixed edge case where all_affected validation was being skipped
 package main
 
 import (
@@ -217,6 +222,9 @@ func LoadFromOSVDev() {
 	// Split by newline
 	lines := strings.Split(string(body), "\n")
 
+	// Aggregate total CVE updates
+	totalCVEsUpdated := 0
+
 	// SERIAL EXECUTION: Loop through lines one by one
 	for _, line := range lines {
 		// CRITICAL FIX: Trim whitespace/carriage returns (\r) BEFORE using the string
@@ -226,11 +234,24 @@ func LoadFromOSVDev() {
 			continue
 		}
 
-		processEcosystem(client, platform)
+		cveCount := processEcosystem(client, platform)
+		totalCVEsUpdated += cveCount
+	}
+
+	// MOVED HERE: Trigger lifecycle tracking update ONCE after all CVEs are loaded
+	if totalCVEsUpdated > 0 {
+		logger.Sugar().Infof("All ecosystems processed. Total CVEs updated: %d. Running lifecycle tracking...", totalCVEsUpdated)
+		if err := updateLifecycleForNewCVEs(totalCVEsUpdated); err != nil {
+			logger.Sugar().Warnf("Failed to update lifecycle tracking after CVE updates: %v", err)
+		} else {
+			logger.Sugar().Infof("Lifecycle tracking update complete")
+		}
+	} else {
+		logger.Sugar().Infof("No CVE updates. Skipping lifecycle tracking.")
 	}
 }
 
-func processEcosystem(client *http.Client, platform string) {
+func processEcosystem(client *http.Client, platform string) int {
 	// 1. Get High Water Mark from database
 	lastRunTime, _ := GetLastRun(platform)
 
@@ -239,20 +260,20 @@ func processEcosystem(client *http.Client, platform string) {
 	resp, err := client.Get(urlStr)
 	if err != nil {
 		logger.Sugar().Errorf("Failed to download %s: %v", platform, err)
-		return
+		return 0
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Sugar().Errorf("Failed to read body for %s: %v", platform, err)
-		return
+		return 0
 	}
 
 	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
 		logger.Sugar().Errorf("Failed to open zip reader for %s: %v", platform, err)
-		return
+		return 0
 	}
 
 	var maxSeenTime = lastRunTime
@@ -322,12 +343,8 @@ func processEcosystem(client *http.Client, platform string) {
 		logger.Sugar().Infof("Completed %s. No new data.", platform)
 	}
 
-	// Trigger lifecycle tracking update for newly disclosed CVEs
-	if cveCount > 0 {
-		if err := updateLifecycleForNewCVEs(cveCount); err != nil {
-			logger.Sugar().Warnf("Failed to update lifecycle tracking after CVE updates: %v", err)
-		}
-	}
+	// Return CVE count for aggregation
+	return cveCount
 }
 
 // newVuln persists the vulnerability
@@ -782,23 +799,40 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 	}
 
 	result := make(map[string]CVEInfo)
+	totalFromQuery := 0
+	filteredByValidation := 0
+	deduplicated := 0
 
 	if cursor.HasMore() {
 		var vulns []VulnRaw
 		if _, err := cursor.ReadDocument(ctx, &vulns); err == nil {
+			totalFromQuery = len(vulns)
 			seen := make(map[string]bool)
+
 			for _, v := range vulns {
-				// Conditional Go-side validation for cases AQL couldn't handle
+				// LOGIC UPDATE: Trust AQL results unless validation is explicitly needed.
+				// This prevents valid matches from being dropped due to strict Go-side checks
+				// on data that the DB has already confirmed is a match.
 				if v.NeedsValidation {
 					if len(v.AllAffected) > 0 {
 						if !isVersionAffectedAny(v.AffectedVersion, v.AllAffected) {
+							filteredByValidation++
+							logger.Sugar().Debugf("FILTERED OUT (Validation Needed): CVE %s for package %s version %s",
+								v.CveID, v.Package, v.AffectedVersion)
 							continue
 						}
+					} else {
+						// If validation is required but we lack the data to do it, we must skip.
+						logger.Sugar().Warnf("CVE %s for package %s needs validation but has no all_affected data - skipping",
+							v.CveID, v.Package)
+						filteredByValidation++
+						continue
 					}
 				}
 
 				key := v.CveID + ":" + v.Package
 				if seen[key] {
+					deduplicated++
 					continue
 				}
 				seen[key] = true
@@ -812,6 +846,10 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 			}
 		}
 	}
+
+	// Debug logging to track filtering
+	logger.Sugar().Debugf("Release %s:%s - CVEs from query: %d, filtered by validation: %d, deduplicated: %d, final: %d",
+		releaseName, releaseVersion, totalFromQuery, filteredByValidation, deduplicated, len(result))
 
 	return result, nil
 }
