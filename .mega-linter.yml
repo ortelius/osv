@@ -1,3 +1,4 @@
+---
 APPLY_FIXES: all
 SHOW_ELAPSED_TIME: true
 FILEIO_REPORTER: false
@@ -34,4 +35,3 @@ PRE_COMMANDS:
   - command: tar -xf go1.25.5.linux-amd64.tar.gz -C /usr/lib
   - command: go version
   - command: golangci-lint cache clean
-

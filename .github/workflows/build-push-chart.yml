@@ -1,6 +1,6 @@
 ---
 name: Build/Push Image and Release Charts
-on:
+"on":
   pull_request:
     paths-ignore:
       - chart/**/Chart.yaml
