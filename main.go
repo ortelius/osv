@@ -201,6 +201,7 @@ func SaveLastRun(ecosystem string, lastModified time.Time) error {
 // Main Import Logic
 // ----------------------------------------------------------------------------
 
+// LoadFromOSVDev main entrypoint to load the osv data
 func LoadFromOSVDev() {
 	baseURL := "https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/ecosystems.txt?alt=media"
 
