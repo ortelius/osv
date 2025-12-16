@@ -18,12 +18,17 @@
       "groupSlug": "all",
       "matchPackagePatterns": [".*"],
       "automerge": true,
-      "autoApprove": true
+      "autoApprove": true,
+      "excludePackageNames": ["github.com/google/osv-scanner"]
     },
     {
       "matchManagers": ["gomod"],
       "matchPackagePatterns": ["^go", "^toolchain"],
       "enabled": false
+    },
+    {
+      "matchPackageNames": ["github.com/google/osv-scanner"],
+      "allowedVersions": "v1.9.2"
     }
   ],
   "separateMajorMinor": false,
