@@ -29,6 +29,7 @@ import (
 	"github.com/arangodb/go-driver/v2/arangodb"
 	"github.com/google/osv-scanner/pkg/models"
 	"github.com/ortelius/pdvd-backend/v12/database"
+	"github.com/ortelius/pdvd-backend/v12/restapi/modules/lifecycle"
 	"github.com/ortelius/pdvd-backend/v12/util"
 )
 
@@ -550,15 +551,10 @@ type ReleaseInfo struct {
 	Version string
 }
 
-type CVEInfo struct {
-	CveID          string
-	Package        string
-	SeverityRating string
-	SeverityScore  float64
-	Published      time.Time
-}
+// Note: Using lifecycle.CVEInfo from shared package
+// type CVEInfo is defined in restapi/modules/lifecycle/handlers.go
 
-func updateLifecycleForNewCVEs(cveUpdateCount int) error {
+func updateLifecycleForNewCVEs(_ int) error {
 	ctx := context.Background()
 
 	// Get all active deployments (syncs) with their sync timestamps
@@ -616,44 +612,24 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 
 		// For each endpoint, create/update lifecycle records
 		for _, endpointName := range dr.Endpoints {
-			for cveID, cveInfo := range cves {
-				key := fmt.Sprintf("%s:%s:%s", cveID, cveInfo.Package, dr.ReleaseName)
+			for _, cveInfo := range cves {
+				// Determine if CVE was disclosed after deployment
+				disclosedAfter := !cveInfo.Published.IsZero() && cveInfo.Published.After(dr.SyncedAt)
 
-				// Check if lifecycle record exists for THIS VERSION
-				checkQuery := `
-					FOR rec IN cve_lifecycle
-						FILTER rec.cve_id == @cve_id
-						FILTER rec.endpoint_name == @endpoint
-						FILTER rec.release_name == @release
-						FILTER rec.package == @package
-						FILTER rec.introduced_version == @version
-						LIMIT 1
-						RETURN rec
-				`
-				checkCursor, err := dbconn.Database.Query(ctx, checkQuery, &arangodb.QueryOptions{
-					BindVars: map[string]interface{}{
-						"cve_id":   cveID,
-						"endpoint": endpointName,
-						"release":  dr.ReleaseName,
-						"package":  cveInfo.Package,
-						"version":  dr.ReleaseVersion,
-					},
-				})
+				// CRITICAL: Use shared lifecycle package
+				// This ensures consistency with sync-based lifecycle tracking
+				err := lifecycle.CreateOrUpdateLifecycleRecord(
+					ctx, dbconn,
+					endpointName,
+					dr.ReleaseName,
+					dr.ReleaseVersion,
+					cveInfo,
+					dr.SyncedAt, // ✅ Actual deployment time
+					disclosedAfter,
+				)
+
 				if err != nil {
-					continue
-				}
-
-				exists := checkCursor.HasMore()
-				checkCursor.Close()
-
-				if !exists {
-					// CRITICAL FIX: Use actual sync timestamp, not time.Now()
-					// Determine if CVE was disclosed after deployment
-					disclosedAfter := !cveInfo.Published.IsZero() && cveInfo.Published.After(dr.SyncedAt)
-
-					if err := createLifecycleRecord(ctx, endpointName, cveInfo, dr.ReleaseName, dr.ReleaseVersion, dr.SyncedAt, disclosedAfter); err != nil {
-						logger.Sugar().Debugf("Failed to create lifecycle record for %s: %v", key, err)
-					}
+					logger.Sugar().Debugf("Failed to create lifecycle record for %s: %v", cveInfo.CVEID, err)
 				}
 			}
 		}
@@ -662,8 +638,8 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 	return nil
 }
 
-func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string]CVEInfo, error) {
-	result := make(map[string]CVEInfo)
+func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string]lifecycle.CVEInfo, error) {
+	result := make(map[string]lifecycle.CVEInfo)
 
 	for _, rel := range releases {
 		cves, err := getCVEsForRelease(ctx, rel.Name, rel.Version)
@@ -678,7 +654,7 @@ func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string
 	return result, nil
 }
 
-func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) (map[string]CVEInfo, error) {
+func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) (map[string]lifecycle.CVEInfo, error) {
 	query := `
 		FOR release IN release
 			FILTER release.name == @name AND release.version == @version
@@ -780,7 +756,7 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 		NeedsValidation bool              `json:"needs_validation"`
 	}
 
-	result := make(map[string]CVEInfo)
+	result := make(map[string]lifecycle.CVEInfo)
 	seen := make(map[string]bool)
 
 	if !cursor.HasMore() {
@@ -812,8 +788,8 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 			}
 		}
 
-		result[v.CveID] = CVEInfo{
-			CveID:          v.CveID,
+		result[v.CveID] = lifecycle.CVEInfo{
+			CVEID:          v.CveID,
 			Package:        v.Package,
 			SeverityRating: v.SeverityRating,
 			SeverityScore:  v.SeverityScore,
@@ -822,94 +798,6 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 	}
 
 	return result, nil
-}
-
-func createLifecycleRecord(ctx context.Context, endpointName string, cveInfo CVEInfo,
-	releaseName, releaseVersion string, introducedAt time.Time, disclosedAfterDeployment bool) error {
-
-	record := map[string]interface{}{
-		"cve_id":                     cveInfo.CveID,
-		"endpoint_name":              endpointName,
-		"release_name":               releaseName,
-		"package":                    cveInfo.Package,
-		"severity_rating":            cveInfo.SeverityRating,
-		"severity_score":             cveInfo.SeverityScore,
-		"introduced_at":              introducedAt,
-		"published":                  cveInfo.Published,
-		"introduced_version":         releaseVersion,
-		"is_remediated":              false,
-		"disclosed_after_deployment": disclosedAfterDeployment,
-		"objtype":                    "CVELifecycleEvent",
-		"created_at":                 time.Now(),
-		"updated_at":                 time.Now(),
-	}
-
-	// CRITICAL FIX: Check for existing record with SAME VERSION first
-	// This prevents creating duplicates when the same version is synced multiple times
-	checkQuery := `
-		FOR rec IN cve_lifecycle
-			FILTER rec.cve_id == @cve_id
-			AND rec.endpoint_name == @endpoint
-			AND rec.release_name == @release
-			AND rec.package == @package
-			AND rec.introduced_version == @version
-			LIMIT 1
-			RETURN rec
-	`
-
-	checkCursor, err := dbconn.Database.Query(ctx, checkQuery, &arangodb.QueryOptions{
-		BindVars: map[string]interface{}{
-			"cve_id":   cveInfo.CveID,
-			"endpoint": endpointName,
-			"release":  releaseName,
-			"package":  cveInfo.Package,
-			"version":  releaseVersion,
-		},
-	})
-	if err != nil {
-		return err
-	}
-
-	recordExists := checkCursor.HasMore()
-	checkCursor.Close()
-
-	if recordExists {
-		// Record exists for this version - just update timestamp
-		updateQuery := `
-			FOR rec IN cve_lifecycle
-				FILTER rec.cve_id == @cve_id
-				AND rec.endpoint_name == @endpoint
-				AND rec.release_name == @release
-				AND rec.package == @package
-				AND rec.introduced_version == @version
-				LIMIT 1
-				UPDATE rec WITH { 
-					updated_at: DATE_NOW(),
-					disclosed_after_deployment: OLD.disclosed_after_deployment || @disclosed_after
-				} IN cve_lifecycle
-		`
-		_, err = dbconn.Database.Query(ctx, updateQuery, &arangodb.QueryOptions{
-			BindVars: map[string]interface{}{
-				"cve_id":          cveInfo.CveID,
-				"endpoint":        endpointName,
-				"release":         releaseName,
-				"package":         cveInfo.Package,
-				"version":         releaseVersion,
-				"disclosed_after": disclosedAfterDeployment,
-			},
-		})
-		return err
-	}
-
-	// Record doesn't exist - create new one
-	// CRITICAL: This allows tracking CVEs across different versions
-	// Each version gets its own lifecycle record
-	query := `INSERT @record IN cve_lifecycle`
-
-	_, err = dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
-		BindVars: map[string]interface{}{"record": record},
-	})
-	return err
 }
 
 func main() {
