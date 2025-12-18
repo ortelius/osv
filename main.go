@@ -5,8 +5,11 @@
 // 1. Added Materialized Edge updating (release2cve) for instant lookups
 // 2. Maintained robust version validation (AQL + Go-side)
 // 3. Fixed cve_lifecycle tracking:
-//   - Now uses UPSERT to handle updates idempotently
-//   - Enforces "Once Post-Deploy, Always Post-Deploy" logic
+//   - Now checks for existing records by version to prevent duplicates
+//   - Allows multiple lifecycle records per CVE (one per version)
+//   - Enables proper version-to-version remediation tracking
+//   - Uses introducedAt from sync time (not time.Now())
+//
 // 4. Refactored helper functions into reusable modules
 package main
 
@@ -558,13 +561,24 @@ type CVEInfo struct {
 func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 	ctx := context.Background()
 
-	// Get all active deployments (syncs)
+	// Get all active deployments (syncs) with their sync timestamps
 	query := `
 		FOR sync IN sync
-			COLLECT release_name = sync.release_name, release_version = sync.release_version INTO groups = sync
+			COLLECT release_name = sync.release_name, 
+			        release_version = sync.release_version 
+			INTO groups = sync
+			
+			LET latest_sync = FIRST(
+				FOR s IN groups
+					SORT s.sync.synced_at DESC
+					LIMIT 1
+					RETURN s.sync
+			)
+			
 			RETURN {
 				release_name: release_name,
 				release_version: release_version,
+				synced_at: latest_sync.synced_at,
 				endpoints: UNIQUE(groups[*].sync.endpoint_name)
 			}
 	`
@@ -576,9 +590,10 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 	defer cursor.Close()
 
 	type DeployedRelease struct {
-		ReleaseName    string   `json:"release_name"`
-		ReleaseVersion string   `json:"release_version"`
-		Endpoints      []string `json:"endpoints"`
+		ReleaseName    string    `json:"release_name"`
+		ReleaseVersion string    `json:"release_version"`
+		SyncedAt       time.Time `json:"synced_at"`
+		Endpoints      []string  `json:"endpoints"`
 	}
 
 	var deployedReleases []DeployedRelease
@@ -604,13 +619,14 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 			for cveID, cveInfo := range cves {
 				key := fmt.Sprintf("%s:%s:%s", cveID, cveInfo.Package, dr.ReleaseName)
 
-				// Check if lifecycle record exists
+				// Check if lifecycle record exists for THIS VERSION
 				checkQuery := `
 					FOR rec IN cve_lifecycle
 						FILTER rec.cve_id == @cve_id
 						FILTER rec.endpoint_name == @endpoint
 						FILTER rec.release_name == @release
 						FILTER rec.package == @package
+						FILTER rec.introduced_version == @version
 						LIMIT 1
 						RETURN rec
 				`
@@ -620,6 +636,7 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 						"endpoint": endpointName,
 						"release":  dr.ReleaseName,
 						"package":  cveInfo.Package,
+						"version":  dr.ReleaseVersion,
 					},
 				})
 				if err != nil {
@@ -630,8 +647,11 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 				checkCursor.Close()
 
 				if !exists {
-					// Create new lifecycle record
-					if err := createLifecycleRecord(ctx, endpointName, cveInfo, dr.ReleaseName, dr.ReleaseVersion, time.Now(), false); err != nil {
+					// CRITICAL FIX: Use actual sync timestamp, not time.Now()
+					// Determine if CVE was disclosed after deployment
+					disclosedAfter := !cveInfo.Published.IsZero() && cveInfo.Published.After(dr.SyncedAt)
+
+					if err := createLifecycleRecord(ctx, endpointName, cveInfo, dr.ReleaseName, dr.ReleaseVersion, dr.SyncedAt, disclosedAfter); err != nil {
 						logger.Sugar().Debugf("Failed to create lifecycle record for %s: %v", key, err)
 					}
 				}
@@ -824,22 +844,69 @@ func createLifecycleRecord(ctx context.Context, endpointName string, cveInfo CVE
 		"updated_at":                 time.Now(),
 	}
 
-	query := `
-		UPSERT { 
-			cve_id: @record.cve_id, 
-			endpoint_name: @record.endpoint_name, 
-			release_name: @record.release_name, 
-			package: @record.package 
-		} 
-		INSERT @record 
-		UPDATE { 
-			updated_at: DATE_NOW(), 
-			disclosed_after_deployment: OLD.disclosed_after_deployment || @record.disclosed_after_deployment 
-		} 
-		IN cve_lifecycle
+	// CRITICAL FIX: Check for existing record with SAME VERSION first
+	// This prevents creating duplicates when the same version is synced multiple times
+	checkQuery := `
+		FOR rec IN cve_lifecycle
+			FILTER rec.cve_id == @cve_id
+			AND rec.endpoint_name == @endpoint
+			AND rec.release_name == @release
+			AND rec.package == @package
+			AND rec.introduced_version == @version
+			LIMIT 1
+			RETURN rec
 	`
 
-	_, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+	checkCursor, err := dbconn.Database.Query(ctx, checkQuery, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{
+			"cve_id":   cveInfo.CveID,
+			"endpoint": endpointName,
+			"release":  releaseName,
+			"package":  cveInfo.Package,
+			"version":  releaseVersion,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	recordExists := checkCursor.HasMore()
+	checkCursor.Close()
+
+	if recordExists {
+		// Record exists for this version - just update timestamp
+		updateQuery := `
+			FOR rec IN cve_lifecycle
+				FILTER rec.cve_id == @cve_id
+				AND rec.endpoint_name == @endpoint
+				AND rec.release_name == @release
+				AND rec.package == @package
+				AND rec.introduced_version == @version
+				LIMIT 1
+				UPDATE rec WITH { 
+					updated_at: DATE_NOW(),
+					disclosed_after_deployment: OLD.disclosed_after_deployment || @disclosed_after
+				} IN cve_lifecycle
+		`
+		_, err = dbconn.Database.Query(ctx, updateQuery, &arangodb.QueryOptions{
+			BindVars: map[string]interface{}{
+				"cve_id":          cveInfo.CveID,
+				"endpoint":        endpointName,
+				"release":         releaseName,
+				"package":         cveInfo.Package,
+				"version":         releaseVersion,
+				"disclosed_after": disclosedAfterDeployment,
+			},
+		})
+		return err
+	}
+
+	// Record doesn't exist - create new one
+	// CRITICAL: This allows tracking CVEs across different versions
+	// Each version gets its own lifecycle record
+	query := `INSERT @record IN cve_lifecycle`
+
+	_, err = dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
 		BindVars: map[string]interface{}{"record": record},
 	})
 	return err
