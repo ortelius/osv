@@ -84,7 +84,7 @@ func LoadFromOSVDev() {
 	// This maintains the cve_lifecycle table for MTTR metrics
 	if totalCVEsUpdated > 0 {
 		logger.Sugar().Infof("All ecosystems processed. Total CVEs updated: %d. Running lifecycle tracking...", totalCVEsUpdated)
-		if err := updateLifecycleForNewCVEs(totalCVEsUpdated); err != nil {
+		if err := updateLifecycleForNewCVEs(); err != nil {
 			logger.Sugar().Warnf("Failed to update lifecycle tracking after CVE updates: %v", err)
 		} else {
 			logger.Sugar().Infof("Lifecycle tracking update complete")
@@ -273,10 +273,8 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			"purl":    basePurl,
 			"objtype": "PURL",
 		}
-		_, err := dbconn.Collections["purl"].CreateDocument(ctx, purlNode)
-		if err != nil {
-			// Already exists, continue
-		}
+
+		dbconn.Collections["purl"].CreateDocument(ctx, purlNode)
 
 		purlDocID := "purl/" + purlKey
 
@@ -557,7 +555,7 @@ type ReleaseInfo struct {
 // Note: Using lifecycle.CVEInfo from shared package
 // type CVEInfo is defined in restapi/modules/lifecycle/handlers.go
 
-func updateLifecycleForNewCVEs(cveUpdateCount int) error {
+func updateLifecycleForNewCVEs() error {
 	ctx := context.Background()
 
 	// Get all active deployments (syncs) with their sync timestamps
