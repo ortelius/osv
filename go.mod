@@ -4,7 +4,6 @@ go 1.25.5
 
 require (
 	github.com/arangodb/go-driver/v2 v2.1.6
-	github.com/google/osv-scanner v1.9.2
 	github.com/ortelius/pdvd-backend/v12 v12.0.171
 )
 
@@ -26,6 +25,7 @@ require (
 	github.com/aquasecurity/go-version v0.0.1 // indirect
 	github.com/arangodb/go-velocypack v0.0.0-20200318135517-5af53c29c67e // indirect
 	github.com/goccy/go-yaml v1.19.0 // indirect
+	github.com/google/osv-scanner v1.9.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
