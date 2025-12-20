@@ -136,6 +136,9 @@ func processEcosystem(client *http.Client, platform string) int {
 				}
 			}
 
+			// Add CVSS scores
+			util.AddCVSSScoresToContent(content)
+
 			wasUpdated, err := newVuln(content)
 			if wasUpdated {
 				cveCount++
@@ -152,7 +155,10 @@ func processEcosystem(client *http.Client, platform string) int {
 		if maxSeenTime.IsZero() {
 			maxSeenTime = time.Now().UTC()
 		}
+		logger.Sugar().Infof("Ecosystem: %s | New CVEs: %d | Updating high water mark to %s", platform, cveCount, maxSeenTime.Format(time.RFC3339))
 		util.SaveLastRun(dbconn, platform, maxSeenTime)
+	} else {
+		logger.Sugar().Infof("Ecosystem: %s | No new CVEs found", platform)
 	}
 
 	return cveCount
@@ -191,8 +197,6 @@ func newVuln(content map[string]interface{}) (bool, error) {
 		return false, nil
 	}
 
-	util.AddCVSSScoresToContent(content)
-
 	query := `UPSERT { _key: @key } INSERT @doc UPDATE @doc IN cve`
 	bindVars := map[string]interface{}{"key": cveKey, "doc": content}
 
@@ -200,171 +204,181 @@ func newVuln(content map[string]interface{}) (bool, error) {
 		return false, err
 	}
 
-	// FIXED: Populate cve2purl Hub
+	// FIXED: Populate cve2purl Hub using working version's approach
 	processEdges(ctx, content)
 
 	return true, nil
 }
 
 func processEdges(ctx context.Context, content map[string]interface{}) error {
-	type EdgeCandidate struct {
-		BasePurl, Ecosystem                                     string
-		IntroducedMajor, IntroducedMinor, IntroducedPatch       *int
-		FixedMajor, FixedMinor, FixedPatch                      *int
-		LastAffectedMajor, LastAffectedMinor, LastAffectedPatch *int
-	}
+	cveID, _ := content["id"].(string)
+	cveKey := util.SanitizeKey(cveID)
+	cveDocID := "cve/" + cveKey
 
-	var edgeCandidates []EdgeCandidate
-	uniqueBasePurls := make(map[string]bool)
-
-	if affected, ok := content["affected"].([]interface{}); ok {
-		for _, aff := range affected {
-			var affectedData models.Affected
-			affBytes, _ := json.Marshal(aff)
-			json.Unmarshal(affBytes, &affectedData)
-
-			var basePurl, ecosystem string
-			if affMap, ok := aff.(map[string]interface{}); ok {
-				if pkg, ok := affMap["package"].(map[string]interface{}); ok {
-					if purlStr, ok := pkg["purl"].(string); ok && purlStr != "" {
-						if cleanedPurl, err := util.CleanPURL(purlStr); err == nil {
-							if bp, err := util.GetBasePURL(cleanedPurl); err == nil {
-								basePurl = bp
-								if parsed, err := util.ParsePURL(cleanedPurl); err == nil {
-									ecosystem = parsed.Type
-								}
-							}
-						}
-					} else if eco, ok := pkg["ecosystem"].(string); ok {
-						if name, ok := pkg["name"].(string); ok {
-							if pt := util.EcosystemToPurlType(eco); pt != "" {
-								basePurl = fmt.Sprintf("pkg:%s/%s", pt, name)
-								ecosystem = pt
-							}
-						}
-					}
-				}
-			}
-
-			if basePurl == "" {
-				continue
-			}
-			uniqueBasePurls[basePurl] = true
-
-			for _, vrange := range affectedData.Ranges {
-				if vrange.Type != models.RangeEcosystem && vrange.Type != models.RangeSemVer {
-					continue
-				}
-				var introduced, fixed, lastAffected *util.ParsedVersion
-				for _, event := range vrange.Events {
-					if event.Introduced != "" {
-						introduced = util.ParseSemanticVersion(event.Introduced)
-					}
-					if event.Fixed != "" {
-						fixed = util.ParseSemanticVersion(event.Fixed)
-					}
-					if event.LastAffected != "" {
-						lastAffected = util.ParseSemanticVersion(event.LastAffected)
-					}
-				}
-
-				candidate := EdgeCandidate{BasePurl: basePurl, Ecosystem: ecosystem}
-				if introduced != nil {
-					candidate.IntroducedMajor, candidate.IntroducedMinor, candidate.IntroducedPatch = introduced.Major, introduced.Minor, introduced.Patch
-				}
-				if fixed != nil {
-					candidate.FixedMajor, candidate.FixedMinor, candidate.FixedPatch = fixed.Major, fixed.Minor, fixed.Patch
-				}
-				if lastAffected != nil {
-					candidate.LastAffectedMajor, candidate.LastAffectedMinor, candidate.LastAffectedPatch = lastAffected.Major, lastAffected.Minor, lastAffected.Patch
-				}
-				edgeCandidates = append(edgeCandidates, candidate)
-			}
-		}
-	}
-
-	if len(edgeCandidates) == 0 {
+	affected, ok := content["affected"].([]interface{})
+	if !ok || len(affected) == 0 {
 		return nil
 	}
 
-	var basePurls []string
-	for p := range uniqueBasePurls {
-		basePurls = append(basePurls, p)
-	}
-
-	// Bulk PURL Upsert with explicit _key
-	purlAql := `
-		FOR purl IN @purls
-			LET key = @util.SanitizeKey(purl)
-			LET upserted = FIRST(
-				UPSERT { _key: key }
-				INSERT { _key: key, purl: purl, objtype: "PURL" }
-				UPDATE {} IN purl
-				RETURN NEW
-			)
-			RETURN { purl: purl, key: upserted._key }
-	`
-	cursor, err := dbconn.Database.Query(ctx, purlAql, &arangodb.QueryOptions{BindVars: map[string]interface{}{"purls": basePurls}})
-	if err != nil {
-		return err
-	}
-	defer cursor.Close()
-
-	purlKeyMap := make(map[string]string)
-	for cursor.HasMore() {
-		var res struct{ Purl, Key string }
-		if _, err := cursor.ReadDocument(ctx, &res); err == nil {
-			purlKeyMap[res.Purl] = res.Key
+	for _, affItem := range affected {
+		affMap, ok := affItem.(map[string]interface{})
+		if !ok {
+			continue
 		}
-	}
 
-	var edges []map[string]interface{}
-	for _, c := range edgeCandidates {
-		if pKey, ok := purlKeyMap[c.BasePurl]; ok {
+		pkgMap, ok := affMap["package"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get base PURL
+		var basePurl string
+		if purl, ok := pkgMap["purl"].(string); ok && purl != "" {
+			cleaned, err := util.CleanPURL(purl)
+			if err != nil {
+				continue
+			}
+			basePurl, err = util.GetBasePURL(cleaned)
+			if err != nil {
+				continue
+			}
+		} else {
+			// Construct from ecosystem + name
+			ecosystem, _ := pkgMap["ecosystem"].(string)
+			name, _ := pkgMap["name"].(string)
+			if ecosystem == "" || name == "" {
+				continue
+			}
+			basePurl = fmt.Sprintf("pkg:%s/%s", strings.ToLower(ecosystem), name)
+		}
+
+		// Ensure PURL node exists
+		purlKey := util.SanitizeKey(basePurl)
+		purlNode := map[string]interface{}{
+			"_key":    purlKey,
+			"purl":    basePurl,
+			"objtype": "PURL",
+		}
+
+		// Use UPSERT to ensure purl exists
+		purlUpsert := `UPSERT { _key: @key } INSERT @doc UPDATE {} IN purl`
+		dbconn.Database.Query(ctx, purlUpsert, &arangodb.QueryOptions{
+			BindVars: map[string]interface{}{
+				"key": purlKey,
+				"doc": purlNode,
+			},
+		})
+
+		purlDocID := "purl/" + purlKey
+
+		// Parse version ranges
+		ranges, _ := affMap["ranges"].([]interface{})
+		if len(ranges) == 0 {
+			continue
+		}
+
+		for _, rangeItem := range ranges {
+			rangeMap, ok := rangeItem.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			rangeType, _ := rangeMap["type"].(string)
+			if rangeType != "ECOSYSTEM" && rangeType != "SEMVER" {
+				continue
+			}
+
+			events, _ := rangeMap["events"].([]interface{})
+			var introduced, fixed, lastAffected string
+
+			for _, evt := range events {
+				evtMap, _ := evt.(map[string]interface{})
+				if intro, ok := evtMap["introduced"].(string); ok {
+					introduced = intro
+				}
+				if fix, ok := evtMap["fixed"].(string); ok {
+					fixed = fix
+				}
+				if last, ok := evtMap["last_affected"].(string); ok {
+					lastAffected = last
+				}
+			}
+
+			// Parse versions
+			introducedParsed := util.ParseSemanticVersion(introduced)
+			fixedParsed := util.ParseSemanticVersion(fixed)
+			lastAffectedParsed := util.ParseSemanticVersion(lastAffected)
+
+			// Get ecosystem
+			ecosystem, _ := pkgMap["ecosystem"].(string)
+
+			// Build edge
 			edge := map[string]interface{}{
-				"_from": fmt.Sprintf("cve/%s", content["_key"]),
-				"_to":   fmt.Sprintf("purl/%s", pKey),
+				"_from":     cveDocID,
+				"_to":       purlDocID,
+				"ecosystem": ecosystem,
 			}
-			if c.Ecosystem != "" {
-				edge["ecosystem"] = c.Ecosystem
+
+			if introducedParsed.Major != nil {
+				edge["introduced_major"] = *introducedParsed.Major
 			}
-			if c.IntroducedMajor != nil {
-				edge["introduced_major"] = *c.IntroducedMajor
+			if introducedParsed.Minor != nil {
+				edge["introduced_minor"] = *introducedParsed.Minor
 			}
-			if c.IntroducedMinor != nil {
-				edge["introduced_minor"] = *c.IntroducedMinor
+			if introducedParsed.Patch != nil {
+				edge["introduced_patch"] = *introducedParsed.Patch
 			}
-			if c.IntroducedPatch != nil {
-				edge["introduced_patch"] = *c.IntroducedPatch
+
+			if fixedParsed.Major != nil {
+				edge["fixed_major"] = *fixedParsed.Major
 			}
-			if c.FixedMajor != nil {
-				edge["fixed_major"] = *c.FixedMajor
+			if fixedParsed.Minor != nil {
+				edge["fixed_minor"] = *fixedParsed.Minor
 			}
-			if c.FixedMinor != nil {
-				edge["fixed_minor"] = *c.FixedMinor
+			if fixedParsed.Patch != nil {
+				edge["fixed_patch"] = *fixedParsed.Patch
 			}
-			if c.FixedPatch != nil {
-				edge["fixed_patch"] = *c.FixedPatch
+
+			if lastAffectedParsed.Major != nil {
+				edge["last_affected_major"] = *lastAffectedParsed.Major
 			}
-			if c.LastAffectedMajor != nil {
-				edge["last_affected_major"] = *c.LastAffectedMajor
+			if lastAffectedParsed.Minor != nil {
+				edge["last_affected_minor"] = *lastAffectedParsed.Minor
 			}
-			if c.LastAffectedMinor != nil {
-				edge["last_affected_minor"] = *c.LastAffectedMinor
+			if lastAffectedParsed.Patch != nil {
+				edge["last_affected_patch"] = *lastAffectedParsed.Patch
 			}
-			if c.LastAffectedPatch != nil {
-				edge["last_affected_patch"] = *c.LastAffectedPatch
+
+			// Check if edge exists
+			checkQuery := `
+				FOR e IN cve2purl
+					FILTER e._from == @from AND e._to == @to
+					LIMIT 1
+					RETURN e
+			`
+			cursor, err := dbconn.Database.Query(ctx, checkQuery, &arangodb.QueryOptions{
+				BindVars: map[string]interface{}{
+					"from": cveDocID,
+					"to":   purlDocID,
+				},
+			})
+			if err != nil {
+				continue
 			}
-			edges = append(edges, edge)
+
+			exists := cursor.HasMore()
+			cursor.Close()
+
+			if !exists {
+				// Insert edge directly using collection
+				_, err = dbconn.Collections["cve2purl"].CreateDocument(ctx, edge)
+				if err != nil {
+					logger.Sugar().Warnf("Failed to create cve2purl edge from %s to %s: %v", cveDocID, purlDocID, err)
+				}
+			}
 		}
 	}
 
-	if len(edges) > 0 {
-		delQ := `FOR edge IN cve2purl FILTER edge._from == @cveId REMOVE edge IN cve2purl`
-		dbconn.Database.Query(ctx, delQ, &arangodb.QueryOptions{BindVars: map[string]interface{}{"cveId": fmt.Sprintf("cve/%s", content["_key"])}})
-		insQ := `FOR edge IN @edges INSERT edge INTO cve2purl`
-		dbconn.Database.Query(ctx, insQ, &arangodb.QueryOptions{BindVars: map[string]interface{}{"edges": edges}})
-	}
 	return nil
 }
 
