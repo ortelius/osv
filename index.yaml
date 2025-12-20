@@ -2,6 +2,17 @@ apiVersion: v1
 entries:
   pdvd-osvdev-job:
   - apiVersion: v2
+    appVersion: 12.0.56
+    created: "2025-12-20T00:50:48.143074716Z"
+    description: osv.dev arangodb loader
+    digest: 402a078f5bfce0d660826467b062c312a17490f78d0ae8f8910186e1ecdec415
+    icon: https://ortelius.github.io/pdvd-charts/ortelius.svg
+    name: pdvd-osvdev-job
+    type: application
+    urls:
+    - https://github.com/ortelius/pdvd-osvdev-job/releases/download/v12.0.56/pdvd-osvdev-job-12.0.56.tgz
+    version: 12.0.56
+  - apiVersion: v2
     appVersion: 12.0.55
     created: "2025-12-19T23:21:04.392907525Z"
     description: osv.dev arangodb loader
@@ -408,4 +419,4 @@ entries:
     urls:
     - https://github.com/ortelius/pdvd-osvdev-job/releases/download/pdvd-osvdev-job-12.0.0/pdvd-osvdev-job-12.0.0.tgz
     version: 12.0.0
-generated: "2025-12-19T23:21:04.392639044Z"
+generated: "2025-12-20T00:50:48.1427218Z"
