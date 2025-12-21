@@ -231,28 +231,29 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			continue
 		}
 
-		// Get base PURL
+		// FIXED: Use centralized PURL standardization
 		var basePurl string
 		if purl, ok := pkgMap["purl"].(string); ok && purl != "" {
 			cleaned, err := util.CleanPURL(purl)
 			if err != nil {
 				continue
 			}
-			basePurl, err = util.GetBasePURL(cleaned)
+			basePurl, err = util.GetStandardBasePURL(cleaned)
 			if err != nil {
 				continue
 			}
 		} else {
-			// Construct from ecosystem + name
+			// FIXED: Construct using centralized helper
 			ecosystem, _ := pkgMap["ecosystem"].(string)
+			namespace, _ := pkgMap["namespace"].(string)
 			name, _ := pkgMap["name"].(string)
 			if ecosystem == "" || name == "" {
 				continue
 			}
-			basePurl = fmt.Sprintf("pkg:%s/%s", strings.ToLower(ecosystem), name)
+			basePurl = util.GetBasePURLFromComponents(ecosystem, namespace, name)
 		}
 
-		// Ensure PURL node exists
+		// Ensure PURL node exists with standardized key
 		purlKey := util.SanitizeKey(basePurl)
 		purlNode := map[string]interface{}{
 			"_key":    purlKey,
@@ -382,94 +383,132 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 	return nil
 }
 
+// main.go - OSV Loader
+
 func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
 	cveID := "cve/" + cveKey
 
-	// 1. Cleanup old edges
+	// 1. Cleanup old edges for this CVE
 	cleanupQuery := `FOR edge IN release2cve FILTER edge._to == @cveID REMOVE edge IN release2cve`
 	dbconn.Database.Query(ctx, cleanupQuery, &arangodb.QueryOptions{BindVars: map[string]interface{}{"cveID": cveID}})
 
-	// 2. Find Candidates using Robust AQL Filter (Traverse CVE -> PURL -> SBOM -> Release)
+	// 2. Find all releases that should have edges to this CVE
+	// Uses same hybrid approach as release handler and GraphQL resolvers
 	query := `
 		FOR cve IN cve
 			FILTER cve._key == @cveKey
+			
 			FOR cveEdge IN cve2purl
 				FILTER cveEdge._from == cve._id
+				
+				LET purl = DOCUMENT(cveEdge._to)
+				FILTER purl != null
+				
 				FOR sbomEdge IN sbom2purl
-					FILTER sbomEdge._to == cveEdge._to
+					FILTER sbomEdge._to == purl._id
 					
+					// ⭐ NUMERIC PRE-FILTER (same as GraphQL resolvers)
 					FILTER (
 						sbomEdge.version_major != null AND 
 						cveEdge.introduced_major != null AND 
 						(cveEdge.fixed_major != null OR cveEdge.last_affected_major != null)
 					) ? (
 						(sbomEdge.version_major > cveEdge.introduced_major OR
-						(sbomEdge.version_major == cveEdge.introduced_major AND 
-						sbomEdge.version_minor > cveEdge.introduced_minor) OR
-						(sbomEdge.version_major == cveEdge.introduced_major AND 
-						sbomEdge.version_minor == cveEdge.introduced_minor AND 
-						sbomEdge.version_patch >= cveEdge.introduced_patch))
+						 (sbomEdge.version_major == cveEdge.introduced_major AND 
+						  sbomEdge.version_minor > cveEdge.introduced_minor) OR
+						 (sbomEdge.version_major == cveEdge.introduced_major AND 
+						  sbomEdge.version_minor == cveEdge.introduced_minor AND 
+						  sbomEdge.version_patch >= cveEdge.introduced_patch))
 						AND
 						(cveEdge.fixed_major != null ? (
 							sbomEdge.version_major < cveEdge.fixed_major OR
 							(sbomEdge.version_major == cveEdge.fixed_major AND 
-							sbomEdge.version_minor < cveEdge.fixed_minor) OR
+							 sbomEdge.version_minor < cveEdge.fixed_minor) OR
 							(sbomEdge.version_major == cveEdge.fixed_major AND 
-							sbomEdge.version_minor == cveEdge.fixed_minor AND 
-							sbomEdge.version_patch < cveEdge.fixed_patch)
+							 sbomEdge.version_minor == cveEdge.fixed_minor AND 
+							 sbomEdge.version_patch < cveEdge.fixed_patch)
 						) : (
 							sbomEdge.version_major < cveEdge.last_affected_major OR
 							(sbomEdge.version_major == cveEdge.last_affected_major AND 
-							sbomEdge.version_minor < cveEdge.last_affected_minor) OR
+							 sbomEdge.version_minor < cveEdge.last_affected_minor) OR
 							(sbomEdge.version_major == cveEdge.last_affected_major AND 
-							sbomEdge.version_minor == cveEdge.last_affected_minor AND 
-							sbomEdge.version_patch <= cveEdge.last_affected_patch)
+							 sbomEdge.version_minor == cveEdge.last_affected_minor AND 
+							 sbomEdge.version_patch <= cveEdge.last_affected_patch)
 						))
-					) : true
+					) : true  // Pass through if numeric components not available
 					
 					FOR release IN 1..1 INBOUND sbomEdge._from release2sbom
 						RETURN {
 							release_id: release._id,
 							package_purl: sbomEdge.full_purl,
+							package_base: purl.purl,
 							package_version: sbomEdge.version,
 							all_affected: cve.affected,
 							needs_validation: sbomEdge.version_major == null OR cveEdge.introduced_major == null
 						}
 	`
 
-	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: map[string]interface{}{"cveKey": cveKey}})
+	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"cveKey": cveKey},
+	})
 	if err != nil {
 		return err
 	}
 	defer cursor.Close()
 
+	type Candidate struct {
+		ReleaseID       string            `json:"release_id"`
+		PackagePurl     string            `json:"package_purl"`
+		PackageBase     string            `json:"package_base"`
+		PackageVersion  string            `json:"package_version"`
+		AllAffected     []models.Affected `json:"all_affected"`
+		NeedsValidation bool              `json:"needs_validation"`
+	}
+
 	var edgesToInsert []map[string]interface{}
+	seenInstances := make(map[string]bool)
+
 	for cursor.HasMore() {
-		var cand struct {
-			ReleaseID, PackagePurl, PackageVersion string
-			AllAffected                            []models.Affected
-			NeedsValidation                        bool
-		}
+		var cand Candidate
 		if _, err := cursor.ReadDocument(ctx, &cand); err != nil {
 			continue
 		}
 
-		if cand.NeedsValidation {
+		// Deduplication using base PURL (one edge per release-package pair)
+		instanceKey := cand.ReleaseID + ":" + cand.PackageBase
+		if seenInstances[instanceKey] {
+			continue
+		}
+
+		// ⭐ GO VALIDATION FALLBACK (same pattern as GraphQL resolvers)
+		if cand.NeedsValidation && len(cand.AllAffected) > 0 {
+			// Use ecosystem-specific parsers for cases without numeric components
 			if !util.IsVersionAffectedAny(cand.PackageVersion, cand.AllAffected) {
 				continue
 			}
 		}
 
+		seenInstances[instanceKey] = true
+
 		edgesToInsert = append(edgesToInsert, map[string]interface{}{
-			"_from": cand.ReleaseID, "_to": cveID, "type": "static_analysis",
-			"package_purl": cand.PackagePurl, "package_version": cand.PackageVersion, "created_at": time.Now(),
+			"_from":           cand.ReleaseID,
+			"_to":             cveID,
+			"type":            "static_analysis",
+			"package_purl":    cand.PackagePurl,
+			"package_base":    cand.PackageBase,
+			"package_version": cand.PackageVersion,
+			"created_at":      time.Now(),
 		})
 	}
 
 	if len(edgesToInsert) > 0 {
 		insQ := `FOR edge IN @edges INSERT edge INTO release2cve`
-		dbconn.Database.Query(ctx, insQ, &arangodb.QueryOptions{BindVars: map[string]interface{}{"edges": edgesToInsert}})
+		_, err := dbconn.Database.Query(ctx, insQ, &arangodb.QueryOptions{
+			BindVars: map[string]interface{}{"edges": edgesToInsert},
+		})
+		return err
 	}
+
 	return nil
 }
 
@@ -535,7 +574,7 @@ func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string
 				FILTER r.name == @name AND r.version == @version
 				FOR cve, edge IN 1..1 OUTBOUND r release2cve
 					RETURN {
-						cve_id: cve.id, published: cve.published, package: edge.package_purl,
+						cve_id: cve.id, published: cve.published, package: edge.package_base,
 						severity_rating: cve.database_specific.severity_rating,
 						severity_score: cve.database_specific.cvss_base_score
 					}
