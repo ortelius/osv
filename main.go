@@ -146,7 +146,7 @@ func processEcosystem(client *http.Client, platform string) int {
 			// Add CVSS scores
 			util.AddCVSSScoresToContent(content)
 
-			wasUpdated, err := newVuln(content)
+			wasUpdated, _ := newVuln(content)
 			if wasUpdated {
 				cveCount++
 				if cveKey, ok := content["_key"].(string); ok {
