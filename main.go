@@ -6,6 +6,9 @@
 // 2. Fixed cve2purl Hub population to prevent empty collections
 // 3. Permanent Fix for Bad Dates using DATE_ISO8601 and DATE_TIMESTAMP
 // 4. Maintained Go-side and AQL version validation
+// 5. Normalized all outgoing timestamps to RFC3339 strings for AQL compatibility
+// 6. BACKEND CONSISTENCY: Matching validation logic with restapi/modules/releases/handlers.go
+// 7. IMPROVED FORMATTING: All AQL queries formatted for maximum readability
 package main
 
 import (
@@ -31,9 +34,9 @@ import (
 var logger = database.InitLogger()
 var dbconn = database.InitializeDatabase()
 
-// ----------------------------------------------------------------------------
+// ============================================================================
 // Main Import Logic
-// ----------------------------------------------------------------------------
+// ============================================================================
 
 func LoadFromOSVDev() {
 	baseURL := "https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/ecosystems.txt?alt=media"
@@ -79,6 +82,10 @@ func LoadFromOSVDev() {
 		logger.Sugar().Infof("No CVE updates. Skipping lifecycle tracking.")
 	}
 }
+
+// ============================================================================
+// Ecosystem Processing
+// ============================================================================
 
 func processEcosystem(client *http.Client, platform string) int {
 	lastRunTime, _ := util.GetLastRun(dbconn, platform)
@@ -164,6 +171,10 @@ func processEcosystem(client *http.Client, platform string) int {
 	return cveCount
 }
 
+// ============================================================================
+// CVE Document Processing
+// ============================================================================
+
 func newVuln(content map[string]interface{}) (bool, error) {
 	var ctx = context.Background()
 	id, ok := content["id"].(string)
@@ -175,40 +186,63 @@ func newVuln(content map[string]interface{}) (bool, error) {
 	content["_key"] = cveKey
 	content["objtype"] = "CVE"
 
-	// Check if already processed
+	// Check if already processed with same modification date
 	modDate, _ := content["modified"].(string)
 	parameters := map[string]interface{}{"key": cveKey}
-	aql := `FOR vuln in cve FILTER vuln._key == @key RETURN vuln.modified`
 
-	cursor, err := dbconn.Database.Query(ctx, aql, &arangodb.QueryOptions{BindVars: parameters})
+	checkModQuery := `
+		FOR vuln IN cve 
+			FILTER vuln._key == @key 
+			RETURN vuln.modified
+	`
+
+	cursor, err := dbconn.Database.Query(ctx, checkModQuery, &arangodb.QueryOptions{
+		BindVars: parameters,
+	})
 	if err == nil {
 		defer cursor.Close()
 		if cursor.HasMore() {
 			var existingMod string
 			if _, err := cursor.ReadDocument(ctx, &existingMod); err == nil {
 				if existingMod == modDate {
-					return false, nil
+					return false, nil // No update needed
 				}
 			}
 		}
 	}
 
+	// Skip CVEs without affected packages
 	if _, exists := content["affected"]; !exists {
 		return false, nil
 	}
 
-	query := `UPSERT { _key: @key } INSERT @doc UPDATE @doc IN cve`
-	bindVars := map[string]interface{}{"key": cveKey, "doc": content}
+	// Upsert CVE document
+	upsertQuery := `
+		UPSERT { _key: @key } 
+		INSERT @doc 
+		UPDATE @doc 
+		IN cve
+	`
+	bindVars := map[string]interface{}{
+		"key": cveKey,
+		"doc": content,
+	}
 
-	if _, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars}); err != nil {
+	if _, err := dbconn.Database.Query(ctx, upsertQuery, &arangodb.QueryOptions{
+		BindVars: bindVars,
+	}); err != nil {
 		return false, err
 	}
 
-	// FIXED: Populate cve2purl Hub using working version's approach
+	// Populate cve2purl Hub edges
 	processEdges(ctx, content)
 
 	return true, nil
 }
+
+// ============================================================================
+// CVE to PURL Hub Edge Processing
+// ============================================================================
 
 func processEdges(ctx context.Context, content map[string]interface{}) error {
 	cveID, _ := content["id"].(string)
@@ -231,7 +265,7 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			continue
 		}
 
-		// FIXED: Use centralized PURL standardization
+		// BACKEND CONSISTENCY: Use centralized PURL standardization
 		var basePurl string
 		if purl, ok := pkgMap["purl"].(string); ok && purl != "" {
 			cleaned, err := util.CleanPURL(purl)
@@ -243,7 +277,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				continue
 			}
 		} else {
-			// FIXED: Construct using centralized helper
 			ecosystem, _ := pkgMap["ecosystem"].(string)
 			namespace, _ := pkgMap["namespace"].(string)
 			name, _ := pkgMap["name"].(string)
@@ -253,7 +286,7 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			basePurl = util.GetBasePURLFromComponents(ecosystem, namespace, name)
 		}
 
-		// Ensure PURL node exists with standardized key
+		// Create PURL hub node
 		purlKey := util.SanitizeKey(basePurl)
 		purlNode := map[string]interface{}{
 			"_key":    purlKey,
@@ -261,9 +294,13 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			"objtype": "PURL",
 		}
 
-		// Use UPSERT to ensure purl exists
-		purlUpsert := `UPSERT { _key: @key } INSERT @doc UPDATE {} IN purl`
-		dbconn.Database.Query(ctx, purlUpsert, &arangodb.QueryOptions{
+		purlUpsertQuery := `
+			UPSERT { _key: @key } 
+			INSERT @doc 
+			UPDATE {} 
+			IN purl
+		`
+		dbconn.Database.Query(ctx, purlUpsertQuery, &arangodb.QueryOptions{
 			BindVars: map[string]interface{}{
 				"key": purlKey,
 				"doc": purlNode,
@@ -272,7 +309,7 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 
 		purlDocID := "purl/" + purlKey
 
-		// Parse version ranges
+		// Process version ranges
 		ranges, _ := affMap["ranges"].([]interface{})
 		if len(ranges) == 0 {
 			continue
@@ -285,41 +322,46 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			}
 
 			rangeType, _ := rangeMap["type"].(string)
-			if rangeType != "ECOSYSTEM" && rangeType != "SEMVER" {
-				continue
-			}
-
 			events, _ := rangeMap["events"].([]interface{})
-			var introduced, fixed, lastAffected string
 
-			for _, evt := range events {
-				evtMap, _ := evt.(map[string]interface{})
-				if intro, ok := evtMap["introduced"].(string); ok {
-					introduced = intro
+			// Extract version events
+			var introduced, fixed, lastAffected string
+			for _, eventItem := range events {
+				eventMap, ok := eventItem.(map[string]interface{})
+				if !ok {
+					continue
 				}
-				if fix, ok := evtMap["fixed"].(string); ok {
-					fixed = fix
+				if introVal, ok := eventMap["introduced"].(string); ok {
+					introduced = introVal
 				}
-				if last, ok := evtMap["last_affected"].(string); ok {
-					lastAffected = last
+				if fixedVal, ok := eventMap["fixed"].(string); ok {
+					fixed = fixedVal
+				}
+				if laVal, ok := eventMap["last_affected"].(string); ok {
+					lastAffected = laVal
 				}
 			}
 
-			// Parse versions
+			if introduced == "" {
+				introduced = "0"
+			}
+
+			// Parse semantic versions for fast range checking
 			introducedParsed := util.ParseSemanticVersion(introduced)
 			fixedParsed := util.ParseSemanticVersion(fixed)
 			lastAffectedParsed := util.ParseSemanticVersion(lastAffected)
 
-			// Get ecosystem
-			ecosystem, _ := pkgMap["ecosystem"].(string)
-
-			// Build edge
+			// Build edge with version metadata
 			edge := map[string]interface{}{
-				"_from":     cveDocID,
-				"_to":       purlDocID,
-				"ecosystem": ecosystem,
+				"_from":         cveDocID,
+				"_to":           purlDocID,
+				"type":          rangeType,
+				"introduced":    introduced,
+				"fixed":         fixed,
+				"last_affected": lastAffected,
 			}
 
+			// Add parsed version components for fast AQL range queries
 			if introducedParsed.Major != nil {
 				edge["introduced_major"] = *introducedParsed.Major
 			}
@@ -350,14 +392,15 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				edge["last_affected_patch"] = *lastAffectedParsed.Patch
 			}
 
-			// Check if edge exists
-			checkQuery := `
+			// Check if edge already exists
+			checkEdgeQuery := `
 				FOR e IN cve2purl
-					FILTER e._from == @from AND e._to == @to
+					FILTER e._from == @from 
+					   AND e._to == @to
 					LIMIT 1
 					RETURN e
 			`
-			cursor, err := dbconn.Database.Query(ctx, checkQuery, &arangodb.QueryOptions{
+			cursor, err := dbconn.Database.Query(ctx, checkEdgeQuery, &arangodb.QueryOptions{
 				BindVars: map[string]interface{}{
 					"from": cveDocID,
 					"to":   purlDocID,
@@ -371,7 +414,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			cursor.Close()
 
 			if !exists {
-				// Insert edge directly using collection
 				_, err = dbconn.Collections["cve2purl"].CreateDocument(ctx, edge)
 				if err != nil {
 					logger.Sugar().Warnf("Failed to create cve2purl edge from %s to %s: %v", cveDocID, purlDocID, err)
@@ -383,65 +425,103 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 	return nil
 }
 
-// main.go - OSV Loader
+// ============================================================================
+// Release to CVE Materialized Edge Creation
+// BACKEND CONSISTENCY: Matches restapi/modules/releases/handlers.go
+// ============================================================================
 
 func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
 	cveID := "cve/" + cveKey
 
-	// 1. Cleanup old edges for this CVE
-	cleanupQuery := `FOR edge IN release2cve FILTER edge._to == @cveID REMOVE edge IN release2cve`
-	dbconn.Database.Query(ctx, cleanupQuery, &arangodb.QueryOptions{BindVars: map[string]interface{}{"cveID": cveID}})
+	// Step 1: Clean up existing edges for this CVE
+	cleanupQuery := `
+		FOR edge IN release2cve 
+			FILTER edge._to == @cveID 
+			REMOVE edge IN release2cve
+	`
+	dbconn.Database.Query(ctx, cleanupQuery, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{
+			"cveID": cveID,
+		},
+	})
 
-	// 2. Find all releases that should have edges to this CVE
-	// Uses same hybrid approach as release handler and GraphQL resolvers
+	// Step 2: Find all releases that should be linked to this CVE
+	// Uses hub-spoke architecture: CVE → PURL ← SBOM ← Release
+	// Includes fast-path version range checking using parsed version components
 	query := `
 		FOR cve IN cve
 			FILTER cve._key == @cveKey
 			
+			// Traverse to PURL hub nodes
 			FOR cveEdge IN cve2purl
 				FILTER cveEdge._from == cve._id
 				
 				LET purl = DOCUMENT(cveEdge._to)
 				FILTER purl != null
 				
+				// Traverse to SBOMs that reference this PURL
 				FOR sbomEdge IN sbom2purl
 					FILTER sbomEdge._to == purl._id
 					
-					// ⭐ NUMERIC PRE-FILTER (same as GraphQL resolvers)
+					// Fast path: Use parsed version metadata for range checking
+					// This avoids expensive ecosystem-specific parsing in AQL
 					FILTER (
+						// Only use fast path if all version metadata is available
 						sbomEdge.version_major != null AND 
 						cveEdge.introduced_major != null AND 
 						(cveEdge.fixed_major != null OR cveEdge.last_affected_major != null)
 					) ? (
-						(sbomEdge.version_major > cveEdge.introduced_major OR
-						 (sbomEdge.version_major == cveEdge.introduced_major AND 
-						  sbomEdge.version_minor > cveEdge.introduced_minor) OR
-						 (sbomEdge.version_major == cveEdge.introduced_major AND 
-						  sbomEdge.version_minor == cveEdge.introduced_minor AND 
-						  sbomEdge.version_patch >= cveEdge.introduced_patch))
+						// Version is in affected range
+						(
+							// Check if version >= introduced
+							sbomEdge.version_major > cveEdge.introduced_major OR
+							(
+								sbomEdge.version_major == cveEdge.introduced_major AND 
+								sbomEdge.version_minor > cveEdge.introduced_minor
+							) OR
+							(
+								sbomEdge.version_major == cveEdge.introduced_major AND 
+								sbomEdge.version_minor == cveEdge.introduced_minor AND 
+								sbomEdge.version_patch >= cveEdge.introduced_patch
+							)
+						)
 						AND
-						(cveEdge.fixed_major != null ? (
-							sbomEdge.version_major < cveEdge.fixed_major OR
-							(sbomEdge.version_major == cveEdge.fixed_major AND 
-							 sbomEdge.version_minor < cveEdge.fixed_minor) OR
-							(sbomEdge.version_major == cveEdge.fixed_major AND 
-							 sbomEdge.version_minor == cveEdge.fixed_minor AND 
-							 sbomEdge.version_patch < cveEdge.fixed_patch)
-						) : (
-							sbomEdge.version_major < cveEdge.last_affected_major OR
-							(sbomEdge.version_major == cveEdge.last_affected_major AND 
-							 sbomEdge.version_minor < cveEdge.last_affected_minor) OR
-							(sbomEdge.version_major == cveEdge.last_affected_major AND 
-							 sbomEdge.version_minor == cveEdge.last_affected_minor AND 
-							 sbomEdge.version_patch <= cveEdge.last_affected_patch)
-						))
-					) : true  // Pass through if numeric components not available
+						(
+							// Check if version < fixed OR version <= last_affected
+							cveEdge.fixed_major != null ? (
+								// Check against fixed version
+								sbomEdge.version_major < cveEdge.fixed_major OR
+								(
+									sbomEdge.version_major == cveEdge.fixed_major AND 
+									sbomEdge.version_minor < cveEdge.fixed_minor
+								) OR
+								(
+									sbomEdge.version_major == cveEdge.fixed_major AND 
+									sbomEdge.version_minor == cveEdge.fixed_minor AND 
+									sbomEdge.version_patch < cveEdge.fixed_patch
+								)
+							) : (
+								// Check against last_affected version
+								sbomEdge.version_major < cveEdge.last_affected_major OR
+								(
+									sbomEdge.version_major == cveEdge.last_affected_major AND 
+									sbomEdge.version_minor < cveEdge.last_affected_minor
+								) OR
+								(
+									sbomEdge.version_major == cveEdge.last_affected_major AND 
+									sbomEdge.version_minor == cveEdge.last_affected_minor AND 
+									sbomEdge.version_patch <= cveEdge.last_affected_patch
+								)
+							)
+						)
+					) : true  // Fallback: allow through for Go-side validation
 					
+					// Traverse to releases that use this SBOM
 					FOR release IN 1..1 INBOUND sbomEdge._from release2sbom
 						RETURN {
 							release_id: release._id,
-							package_purl: sbomEdge.full_purl,
-							package_base: purl.purl,
+							package_purl_full: sbomEdge.full_purl,
+							package_purl_base: purl.purl,
 							package_version: sbomEdge.version,
 							all_affected: cve.affected,
 							needs_validation: sbomEdge.version_major == null OR cveEdge.introduced_major == null
@@ -449,7 +529,9 @@ func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
 	`
 
 	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
-		BindVars: map[string]interface{}{"cveKey": cveKey},
+		BindVars: map[string]interface{}{
+			"cveKey": cveKey,
+		},
 	})
 	if err != nil {
 		return err
@@ -458,8 +540,8 @@ func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
 
 	type Candidate struct {
 		ReleaseID       string            `json:"release_id"`
-		PackagePurl     string            `json:"package_purl"`
-		PackageBase     string            `json:"package_base"`
+		PackagePurlFull string            `json:"package_purl_full"`
+		PackagePurlBase string            `json:"package_purl_base"`
 		PackageVersion  string            `json:"package_version"`
 		AllAffected     []models.Affected `json:"all_affected"`
 		NeedsValidation bool              `json:"needs_validation"`
@@ -468,43 +550,94 @@ func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
 	var edgesToInsert []map[string]interface{}
 	seenInstances := make(map[string]bool)
 
+	// Step 3: Process candidates and validate if needed
 	for cursor.HasMore() {
 		var cand Candidate
 		if _, err := cursor.ReadDocument(ctx, &cand); err != nil {
 			continue
 		}
 
-		// Deduplication using base PURL (one edge per release-package pair)
-		instanceKey := cand.ReleaseID + ":" + cand.PackageBase
+		// Deduplication: One edge per (Release, Base PURL) pair
+		instanceKey := cand.ReleaseID + ":" + cand.PackagePurlBase
 		if seenInstances[instanceKey] {
 			continue
 		}
 
-		// ⭐ GO VALIDATION FALLBACK (same pattern as GraphQL resolvers)
+		// BACKEND CONSISTENCY: Match validation logic from restapi/modules/releases/handlers.go
+		// Perform ecosystem-specific version validation if fast path was unavailable
 		if cand.NeedsValidation && len(cand.AllAffected) > 0 {
-			// Use ecosystem-specific parsers for cases without numeric components
-			if !util.IsVersionAffectedAny(cand.PackageVersion, cand.AllAffected) {
+			matchFound := false
+
+			// Iterate through all affected entries in the CVE
+			for _, affected := range cand.AllAffected {
+				// Extract PURL from affected entry
+				affectedPurl := ""
+				if affected.Package.Purl != "" {
+					affectedPurl = affected.Package.Purl
+				} else {
+					// Build PURL from components
+					ecosystem := string(affected.Package.Ecosystem)
+					namespace := affected.Package.Name
+
+					// Handle scoped packages (e.g., @org/package)
+					if strings.Contains(namespace, "/") {
+						parts := strings.Split(namespace, "/")
+						if len(parts) == 2 {
+							namespace = parts[0]
+						}
+					}
+
+					affectedPurl = util.GetBasePURLFromComponents(ecosystem, namespace, affected.Package.Name)
+				}
+
+				// Standardize the affected PURL for comparison
+				standardizedAffectedPurl, err := util.GetStandardBasePURL(affectedPurl)
+				if err != nil {
+					continue
+				}
+
+				// Only validate if the base PURLs match
+				// This ensures we're checking the correct affected entry
+				if standardizedAffectedPurl == cand.PackagePurlBase {
+					// Use ecosystem-specific version validation
+					if util.IsVersionAffected(cand.PackageVersion, affected) {
+						matchFound = true
+						break
+					}
+				}
+			}
+
+			// Skip this candidate if validation failed
+			if !matchFound {
 				continue
 			}
 		}
 
+		// Mark as processed
 		seenInstances[instanceKey] = true
 
+		// Step 4: Create materialized edge
 		edgesToInsert = append(edgesToInsert, map[string]interface{}{
 			"_from":           cand.ReleaseID,
 			"_to":             cveID,
 			"type":            "static_analysis",
-			"package_purl":    cand.PackagePurl,
-			"package_base":    cand.PackageBase,
+			"package_purl":    cand.PackagePurlFull,
+			"package_base":    cand.PackagePurlBase,
 			"package_version": cand.PackageVersion,
-			"created_at":      time.Now(),
+			"created_at":      time.Now().UTC().Format(time.RFC3339),
 		})
 	}
 
+	// Step 5: Batch insert edges
 	if len(edgesToInsert) > 0 {
-		insQ := `FOR edge IN @edges INSERT edge INTO release2cve`
-		_, err := dbconn.Database.Query(ctx, insQ, &arangodb.QueryOptions{
-			BindVars: map[string]interface{}{"edges": edgesToInsert},
+		insertQuery := `
+			FOR edge IN @edges 
+				INSERT edge INTO release2cve
+		`
+		_, err := dbconn.Database.Query(ctx, insertQuery, &arangodb.QueryOptions{
+			BindVars: map[string]interface{}{
+				"edges": edgesToInsert,
+			},
 		})
 		return err
 	}
@@ -512,11 +645,18 @@ func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
 	return nil
 }
 
+// ============================================================================
+// Lifecycle Tracking Update
+// ============================================================================
+
 func updateLifecycleForNewCVEs(_ int) error {
 	ctx := context.Background()
-	// FIXED: Normalized timestamps and robust sorting
-	query := `
+
+	// Get current state of all endpoints with their active releases
+	// Uses DATE_ISO8601 for robust parsing of string-based synced_at timestamps
+	endpointStateQuery := `
 		FOR endpoint IN endpoint
+			// Find latest sync event for this endpoint
 			LET latestSync = (
 				FOR sync IN sync
 					FILTER sync.endpoint_name == endpoint.name
@@ -524,14 +664,20 @@ func updateLifecycleForNewCVEs(_ int) error {
 					LIMIT 1
 					RETURN sync
 			)[0]
+			
 			FILTER latestSync != null
 			
+			// Get all releases at this sync timestamp (current state)
 			LET activeReleases = (
 				FOR sync IN sync
 					FILTER sync.endpoint_name == endpoint.name
 					FILTER sync.synced_at == latestSync.synced_at
-					RETURN { name: sync.release_name, version: sync.release_version }
+					RETURN {
+						name: sync.release_name,
+						version: sync.release_version
+					}
 			)
+			
 			RETURN {
 				endpoint_name: endpoint.name,
 				releases: activeReleases,
@@ -539,12 +685,13 @@ func updateLifecycleForNewCVEs(_ int) error {
 			}
 	`
 
-	cursor, err := dbconn.Database.Query(ctx, query, nil)
+	cursor, err := dbconn.Database.Query(ctx, endpointStateQuery, nil)
 	if err != nil {
 		return err
 	}
 	defer cursor.Close()
 
+	// Process each endpoint
 	for cursor.HasMore() {
 		var state struct {
 			EndpointName string
@@ -555,45 +702,106 @@ func updateLifecycleForNewCVEs(_ int) error {
 			continue
 		}
 
+		// Get all CVEs affecting these releases
 		currentCVEs, _ := getCVEsForReleases(ctx, state.Releases)
+
+		// Update lifecycle records for each CVE
 		for _, cveInfo := range currentCVEs {
+			// Check if CVE was disclosed after deployment
 			disclosedAfter := !cveInfo.Published.IsZero() && cveInfo.Published.After(state.LastSyncTime)
-			lifecycle.CreateOrUpdateLifecycleRecord(ctx, dbconn, state.EndpointName, cveInfo.ReleaseName, cveInfo.ReleaseVersion, cveInfo, state.LastSyncTime, disclosedAfter)
+
+			// Create or update lifecycle record
+			// The lifecycle package handles normalization of state.LastSyncTime internally
+			lifecycle.CreateOrUpdateLifecycleRecord(
+				ctx,
+				dbconn,
+				state.EndpointName,
+				cveInfo.ReleaseName,
+				cveInfo.ReleaseVersion,
+				cveInfo,
+				state.LastSyncTime,
+				disclosedAfter,
+			)
 		}
 	}
+
 	return nil
 }
 
-type ReleaseInfo struct{ Name, Version string }
+// ============================================================================
+// Helper Types and Functions
+// ============================================================================
 
+type ReleaseInfo struct {
+	Name    string
+	Version string
+}
+
+// getCVEsForReleases retrieves all CVEs affecting the given releases
 func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string]lifecycle.CVEInfo, error) {
 	result := make(map[string]lifecycle.CVEInfo)
+
 	for _, rel := range releases {
-		query := `
+		// Query CVEs via materialized release2cve edges
+		cveQuery := `
 			FOR r IN release
-				FILTER r.name == @name AND r.version == @version
+				FILTER r.name == @name 
+				   AND r.version == @version
+				
+				// Traverse release2cve materialized edges
 				FOR cve, edge IN 1..1 OUTBOUND r release2cve
 					RETURN {
-						cve_id: cve.id, published: cve.published, package: edge.package_base,
+						cve_id: cve.id,
+						published: cve.published,
+						package: edge.package_base,
 						severity_rating: cve.database_specific.severity_rating,
 						severity_score: cve.database_specific.cvss_base_score
 					}
 		`
-		cursor, _ := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: map[string]interface{}{"name": rel.Name, "version": rel.Version}})
+
+		cursor, _ := dbconn.Database.Query(ctx, cveQuery, &arangodb.QueryOptions{
+			BindVars: map[string]interface{}{
+				"name":    rel.Name,
+				"version": rel.Version,
+			},
+		})
+
 		for cursor.HasMore() {
 			var v struct {
-				CveID, Published, Package, SeverityRating string
-				SeverityScore                             float64
+				CveID          string  `json:"cve_id"`
+				Published      string  `json:"published"`
+				Package        string  `json:"package"`
+				SeverityRating string  `json:"severity_rating"`
+				SeverityScore  float64 `json:"severity_score"`
 			}
+
 			if _, err := cursor.ReadDocument(ctx, &v); err == nil {
 				pub, _ := time.Parse(time.RFC3339, v.Published)
+
+				// Create unique key for deduplication
 				key := fmt.Sprintf("%s:%s:%s", v.CveID, v.Package, rel.Name)
-				result[key] = lifecycle.CVEInfo{CVEID: v.CveID, Package: v.Package, SeverityRating: v.SeverityRating, SeverityScore: v.SeverityScore, Published: pub, ReleaseName: rel.Name, ReleaseVersion: rel.Version}
+
+				result[key] = lifecycle.CVEInfo{
+					CVEID:          v.CveID,
+					Package:        v.Package,
+					SeverityRating: v.SeverityRating,
+					SeverityScore:  v.SeverityScore,
+					Published:      pub,
+					ReleaseName:    rel.Name,
+					ReleaseVersion: rel.Version,
+				}
 			}
 		}
 		cursor.Close()
 	}
+
 	return result, nil
 }
 
-func main() { LoadFromOSVDev() }
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+func main() {
+	LoadFromOSVDev()
+}
