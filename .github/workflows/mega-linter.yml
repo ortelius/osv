@@ -31,7 +31,7 @@ jobs:
 
       - name: MegaLinter
         id: ml
-        uses: oxsecurity/megalinter/flavors/go@4d4fd505eebd2703ea5cef977685b43d91fed112
+        uses: oxsecurity/megalinter/flavors/go@ce9183c657f5ccf09342c1221a76b262f052c50f
         env:
           VALIDATE_ALL_CODEBASE: true
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
