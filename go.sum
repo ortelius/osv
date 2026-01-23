@@ -101,6 +101,8 @@ github.com/ortelius/pdvd-backend/v12 v12.0.303 h1:cpHR3VMAzFSmeF+0K5MANFptnVtl3h
 github.com/ortelius/pdvd-backend/v12 v12.0.303/go.mod h1:yvgrZ+45EDufbtgoOQW9Ye0yjUmuwEZ7JDfVeErMcNI=
 github.com/ortelius/pdvd-backend/v12 v12.0.306 h1:F4hTXqDfSOi7IN2NLfDdVBErKKwKwgIRFICAM+VIKIE=
 github.com/ortelius/pdvd-backend/v12 v12.0.306/go.mod h1:yvgrZ+45EDufbtgoOQW9Ye0yjUmuwEZ7JDfVeErMcNI=
+github.com/ortelius/pdvd-backend/v12 v12.0.313 h1:0mObJOWziPeMBRuLMbvbDz2q56UhUutsgLvfTn5ugXE=
+github.com/ortelius/pdvd-backend/v12 v12.0.313/go.mod h1:yvgrZ+45EDufbtgoOQW9Ye0yjUmuwEZ7JDfVeErMcNI=
 github.com/package-url/packageurl-go v0.1.3 h1:4juMED3hHiz0set3Vq3KeQ75KD1avthoXLtmE3I0PLs=
 github.com/package-url/packageurl-go v0.1.3/go.mod h1:nKAWB8E6uk1MHqiS/lQb9pYBGH2+mdJ2PJc2s50dQY0=
 github.com/pandatix/go-cvss v0.6.2 h1:TFiHlzUkT67s6UkelHmK6s1INKVUG7nlKYiWWDTITGI=
